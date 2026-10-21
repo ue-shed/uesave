@@ -45,6 +45,17 @@ impl PropertySchemas {
         self.schemas.insert(path, tag);
     }
 
+    /// Record a schema at the given path, only allocating the key the first time
+    /// the path is seen. Same result as [`record`](Self::record).
+    pub fn record_at(&mut self, path: &str, tag: PropertyTagPartial) {
+        match self.schemas.get_mut(path) {
+            Some(existing) => *existing = tag,
+            None => {
+                self.schemas.insert(path.to_owned(), tag);
+            }
+        }
+    }
+
     /// Get a schema at the given path
     pub fn get(&self, path: &str) -> Option<&PropertyTagPartial> {
         self.schemas.get(path)
@@ -58,9 +69,14 @@ impl PropertySchemas {
 
 /// Represents the current position in the property hierarchy as a stack of names.
 /// Used for looking up type hints in the Types map.
+///
+/// The dot-joined path is kept up to date as names are pushed and popped, so
+/// lookups borrow it instead of joining the components for every property.
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
-    components: Vec<String>,
+    path: String,
+    /// Length of `path` before each push, so `pop` can truncate back to it.
+    starts: Vec<usize>,
 }
 
 impl Scope {
@@ -69,15 +85,26 @@ impl Scope {
     }
 
     pub fn path(&self) -> String {
-        self.components.join(".")
+        self.path.clone()
+    }
+
+    /// The current path, borrowed.
+    pub fn as_str(&self) -> &str {
+        &self.path
     }
 
     pub fn push(&mut self, name: &str) {
-        self.components.push(name.to_string());
+        self.starts.push(self.path.len());
+        if self.starts.len() > 1 {
+            self.path.push('.');
+        }
+        self.path.push_str(name);
     }
 
     pub fn pop(&mut self) {
-        self.components.pop();
+        if let Some(start) = self.starts.pop() {
+            self.path.truncate(start);
+        }
     }
 }
 
@@ -135,7 +162,7 @@ impl<S> SaveGameArchive<S> {
         self.scope.path()
     }
     fn get_type(&self) -> Option<&StructType> {
-        self.types.types.get(&self.path())
+        self.types.types.get(self.scope.as_str())
     }
     pub fn set_version(&mut self, version: Header) {
         self.version = Some(version);

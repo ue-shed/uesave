@@ -59,6 +59,12 @@ pub trait ArchiveReader: Read + Seek {
     /// Record a property schema at the given path
     fn record_schema(&mut self, path: String, tag: PropertyTagPartial);
 
+    /// Record a property schema at the current scope path
+    fn record_schema_at_scope(&mut self, tag: PropertyTagPartial) {
+        let path = self.path();
+        self.record_schema(path, tag);
+    }
+
     /// Get the current property path in the scope hierarchy
     fn path(&self) -> String;
 
@@ -165,6 +171,12 @@ where
 
     fn record_schema(&mut self, path: String, tag: PropertyTagPartial) {
         self.schemas.borrow_mut().record(path, tag);
+    }
+
+    fn record_schema_at_scope(&mut self, tag: PropertyTagPartial) {
+        self.schemas
+            .borrow_mut()
+            .record_at(self.scope.as_str(), tag);
     }
 
     fn path(&self) -> String {
