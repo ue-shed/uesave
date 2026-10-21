@@ -14,7 +14,19 @@
 > - `sav_to_json` returns compact JSON instead of pretty-printed JSON.
 > - Faster parsing: the buffering reader reads ahead in chunks instead of one byte
 >   per refill, scope paths and schema records no longer allocate per property, and
->   byte arrays and strings avoid extra copies.
+>   byte arrays and strings avoid extra copies, and type names are matched without
+>   allocating. Release builds use LTO.
+> - `SaveReader::only(paths)` reads just the properties at those paths (and whatever
+>   contains them), skipping the rest by their tag size without parsing them. For
+>   pulling a few values out of a large save. WASM: `sav_to_json_only`.
+> - `SaveReader::read_seekable` reads from a stream that can already seek, without the
+>   buffering copy `read` makes.
+> - `CompressedReader` reads UE's zlib-chunked compressed archives
+>   (`FArchiveLoadCompressedProxy`) as a seekable stream, inflating only the chunks
+>   that are read. Combined with `only`, a few values come out of a compressed save
+>   without decompressing most of it. WASM: `compressed_sav_to_json`,
+>   `compressed_sav_to_json_only`, and `sav_property_bytes` to get a byte array
+>   property (such as a compressed payload) without converting the save to JSON.
 > - Lengths read from a save no longer reserve memory up front. A misparsed property
 >   could reserve gigabytes before falling back to raw bytes, which aborts 32-bit WASM.
 >
