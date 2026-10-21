@@ -78,6 +78,11 @@ pub trait ArchiveReader: Read + Seek {
     fn error_to_raw(&self) -> bool {
         false
     }
+
+    /// Returns true if the property at the current scope should be skipped rather than read
+    fn skip_property(&self) -> bool {
+        false
+    }
 }
 
 pub trait ArchiveWriter: Write + Seek {
@@ -189,6 +194,12 @@ where
 
     fn error_to_raw(&self) -> bool {
         SaveGameArchive::error_to_raw(self)
+    }
+
+    fn skip_property(&self) -> bool {
+        self.filter
+            .as_ref()
+            .is_some_and(|filter| !filter.includes(self.scope.as_str()))
     }
 }
 impl<W> ArchiveWriter for SaveGameArchive<W>

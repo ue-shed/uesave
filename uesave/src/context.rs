@@ -27,6 +27,34 @@ impl Types {
     }
 }
 
+/// Property paths to read, in the same dot-joined form as [`Types`] paths. A property
+/// whose path is neither kept nor on the way to a kept path is skipped using the size
+/// in its tag, without being parsed. Everything inside a kept path is read.
+#[derive(Debug, Default, Clone)]
+pub struct PropertyFilter {
+    paths: Vec<String>,
+}
+impl PropertyFilter {
+    /// Keep the properties at `paths` (and everything inside them)
+    pub fn new(paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            paths: paths.into_iter().map(Into::into).collect(),
+        }
+    }
+    /// Whether the property at `path` should be read
+    pub fn includes(&self, path: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|kept| is_within(path, kept) || is_within(kept, path))
+    }
+}
+
+/// Whether `path` is `scope` or a property inside it.
+fn is_within(path: &str, scope: &str) -> bool {
+    path.strip_prefix(scope)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 /// Storage for property schemas (tags) separated from property data.
 /// Maps property paths to their type metadata.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +145,7 @@ pub struct SaveGameArchive<S> {
     pub(crate) log: bool,
     pub(crate) error_to_raw: bool,
     pub(crate) schemas: Rc<RefCell<PropertySchemas>>,
+    pub(crate) filter: Option<Rc<PropertyFilter>>,
 }
 impl<R: Read> Read for SaveGameArchive<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -150,6 +179,7 @@ impl<S> SaveGameArchive<S> {
             log: false,
             error_to_raw: false,
             schemas: Rc::new(RefCell::new(PropertySchemas::new())),
+            filter: None,
         }
     }
     pub(crate) fn run<F, T>(stream: S, f: F) -> T

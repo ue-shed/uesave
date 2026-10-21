@@ -583,3 +583,129 @@ fn test_json_roundtrip() {
 
     assert!(original_bytes == roundtripped_bytes);
 }
+
+#[test]
+fn test_read_seekable_matches_read() {
+    let buffered = SaveReader::new().read(Cursor::new(SAVE)).unwrap();
+    let seekable = SaveReader::new().read_seekable(Cursor::new(SAVE)).unwrap();
+    assert_eq!(buffered, seekable);
+}
+
+#[test]
+fn test_only_reads_requested_properties() {
+    let full = SaveReader::new().read(Cursor::new(SAVE)).unwrap();
+    let names: Vec<&PropertyKey> = full.root.properties.0.keys().collect();
+    assert!(
+        names.len() > 2,
+        "fixture should have several root properties"
+    );
+    let kept = [&names[0].1, &names[names.len() - 1].1];
+
+    let only = SaveReader::new()
+        .only(kept.iter().map(|name| name.to_string()))
+        .read_seekable(Cursor::new(SAVE))
+        .unwrap();
+
+    let only_names: Vec<&String> = only.root.properties.0.keys().map(|key| &key.1).collect();
+    assert_eq!(only_names, kept);
+    for (key, value) in &only.root.properties.0 {
+        assert_eq!(Some(value), full.root.properties.0.get(key));
+    }
+}
+
+#[test]
+fn test_property_filter_includes() {
+    let filter = PropertyFilter::new(["SaveData.playerInfo", "Version"]);
+    assert!(filter.includes("SaveData"));
+    assert!(filter.includes("SaveData.playerInfo"));
+    assert!(filter.includes("SaveData.playerInfo.Name"));
+    assert!(filter.includes("Version"));
+    assert!(!filter.includes("SaveData.players"));
+    assert!(!filter.includes("SaveData.playerInfoExtra"));
+    assert!(!filter.includes("VersionOld"));
+}
+
+/// Pack `data` as a UE compressed archive holding a length-prefixed byte array, in
+/// small chunks so reads cross chunk boundaries.
+fn ue_compress(data: &[u8], chunk_size: usize) -> Vec<u8> {
+    let mut payload = (data.len() as u32).to_le_bytes().to_vec();
+    payload.extend_from_slice(data);
+    let chunks: Vec<(Vec<u8>, usize)> = payload
+        .chunks(chunk_size)
+        .map(|chunk| {
+            (
+                miniz_oxide::deflate::compress_to_vec_zlib(chunk, 6),
+                chunk.len(),
+            )
+        })
+        .collect();
+    let mut out = vec![];
+    for value in [
+        0x9E2A83C1,
+        chunk_size as u64,
+        chunks.iter().map(|(c, _)| c.len() as u64).sum(),
+        payload.len() as u64,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    for (compressed, len) in &chunks {
+        out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(*len as u64).to_le_bytes());
+    }
+    for (compressed, _) in &chunks {
+        out.extend_from_slice(compressed);
+    }
+    out
+}
+
+fn open_ue_compressed(compressed: &[u8]) -> CompressedReader<'_> {
+    let mut stream = CompressedReader::new(compressed).unwrap();
+    let mut prefix = [0; 4];
+    stream.read_exact(&mut prefix).unwrap();
+    stream.window(4, u32::from_le_bytes(prefix) as u64).unwrap()
+}
+
+#[test]
+fn test_compressed_reader_reads_save() {
+    let compressed = ue_compress(SAVE, 1000);
+    assert_eq!(
+        open_ue_compressed(&compressed).decompress_all().unwrap(),
+        SAVE
+    );
+
+    let plain = SaveReader::new().read(Cursor::new(SAVE)).unwrap();
+    let lazy = SaveReader::new()
+        .read_seekable(open_ue_compressed(&compressed))
+        .unwrap();
+    assert_eq!(plain, lazy);
+
+    let name = plain.root.properties.0.keys().last().unwrap().1.clone();
+    let plain_only = SaveReader::new()
+        .only([name.clone()])
+        .read_seekable(Cursor::new(SAVE))
+        .unwrap();
+    let lazy_only = SaveReader::new()
+        .only([name])
+        .read_seekable(open_ue_compressed(&compressed))
+        .unwrap();
+    assert_eq!(plain_only, lazy_only);
+}
+
+#[test]
+fn test_compressed_reader_rejects_bad_data() {
+    let compressed = ue_compress(SAVE, 1000);
+    let mut bad_tag = compressed.clone();
+    bad_tag[0] ^= 0xFF;
+    assert!(CompressedReader::new(&bad_tag).is_err());
+    assert!(CompressedReader::new(&compressed[..compressed.len() - 10]).is_err());
+
+    let mut corrupt = compressed.clone();
+    let last = corrupt.len() - 3;
+    corrupt[last] ^= 0xFF;
+    let mut reader = CompressedReader::new(&corrupt).unwrap();
+    assert!(reader.read_to_end(&mut vec![]).is_err());
+
+    let reader = CompressedReader::new(&compressed).unwrap();
+    let len = reader.len();
+    assert!(reader.window(len - 1, 2).is_err());
+}

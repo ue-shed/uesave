@@ -28,6 +28,7 @@ match save.root.properties["NumberOfGamesPlayed"] {
 */
 
 mod archive;
+mod compressed;
 mod context;
 mod error;
 mod serialization;
@@ -36,7 +37,8 @@ mod serialization;
 mod tests;
 
 pub use archive::{ArchiveReader, ArchiveType, ArchiveWriter, SaveGameArchiveType};
-pub use context::{PropertySchemas, SaveGameArchive, Scope, Types};
+pub use compressed::CompressedReader;
+pub use context::{PropertyFilter, PropertySchemas, SaveGameArchive, Scope, Types};
 pub use error::{Error, ParseError};
 
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
@@ -234,6 +236,23 @@ pub fn write_string<A: ArchiveWriter>(ar: &mut A, string: &str) -> Result<()> {
 }
 
 #[cfg_attr(feature = "tracing", instrument(skip_all))]
+/// Longest string [`read_string_with`] reads without allocating.
+const SHORT_STRING_BYTES: usize = 64;
+
+/// Read a string like [`read_string`] and pass it to `f`, without allocating when it is
+/// short UTF-8, as type names are. For strings that are only matched, not kept.
+fn read_string_with<A: ArchiveReader, T>(ar: &mut A, f: impl FnOnce(&str) -> T) -> Result<T> {
+    let len = ar.read_i32::<LE>()?;
+    if (0..=SHORT_STRING_BYTES as i32).contains(&len) {
+        let mut buffer = [0; SHORT_STRING_BYTES];
+        let chars = &mut buffer[..len as usize];
+        ar.read_exact(chars)?;
+        let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+        return Ok(f(&String::from_utf8_lossy(&chars[..length])));
+    }
+    ar.seek(std::io::SeekFrom::Current(-4))?;
+    Ok(f(&ar.read_string()?))
+}
 fn read_string_trailing<A: ArchiveReader>(ar: &mut A) -> Result<(String, Vec<u8>)> {
     let len = ar.read_i32::<LE>()?;
     if len < 0 {
@@ -410,9 +429,13 @@ pub fn write_properties_none_terminated<T: ArchiveType, A: ArchiveWriter<Archive
 fn read_property<T: ArchiveType, A: ArchiveReader<ArchiveType = T>>(
     ar: &mut A,
 ) -> Result<Option<(PropertyKey, Property<T>)>> {
-    if let Some(mut tag) = PropertyTagFull::read(ar)? {
-        let tag_name = tag.name.to_string();
-        ar.scope().push(&tag_name);
+    while let Some(mut tag) = PropertyTagFull::read(ar)? {
+        ar.scope().push(&tag.name);
+        if ar.skip_property() {
+            ar.scope().pop();
+            ar.seek(std::io::SeekFrom::Current(tag.size as i64))?;
+            continue;
+        }
         let (value, updated_tag_data) = match Property::read(ar, &tag) {
             Ok(result) => result,
             Err(e) => {
@@ -427,16 +450,15 @@ fn read_property<T: ArchiveType, A: ArchiveReader<ArchiveType = T>>(
             tag.data = new_data;
         }
 
-        let key = PropertyKey(tag.index, tag_name);
+        let key = PropertyKey(tag.index, std::mem::take(&mut tag.name).into_owned());
 
         // Record the final, complete schema
         ar.record_schema_at_scope(tag.into_partial());
         ar.scope().pop();
 
-        Ok(Some((key, value)))
-    } else {
-        Ok(None)
+        return Ok(Some((key, value)));
     }
+    Ok(None)
 }
 #[cfg_attr(feature = "tracing", instrument(skip_all))]
 fn write_property<T: ArchiveType, A: ArchiveWriter<ArchiveType = T>>(
@@ -1186,7 +1208,7 @@ macro_rules! define_property_types {
 
             #[cfg_attr(feature = "tracing", instrument(name = "PropertyType_read", skip_all))]
             fn read<A: ArchiveReader>(ar: &mut A) -> Result<Self> {
-                Self::try_from(&ar.read_string()?)
+                read_string_with(ar, Self::try_from)?
             }
 
             fn try_from(name: &str) -> Result<Self> {
@@ -1294,7 +1316,7 @@ macro_rules! define_struct_types {
 
             #[cfg_attr(feature = "tracing", instrument(name = "StructType_read", skip_all))]
             fn read<A: ArchiveReader>(ar: &mut A) -> Result<Self> {
-                Ok(ar.read_string()?.into())
+                read_string_with(ar, |name| StructType::from(name))
             }
 
             fn write<A: ArchiveWriter>(&self, ar: &mut A) -> Result<()> {
@@ -4994,6 +5016,7 @@ impl Save {
             log: false,
             error_to_raw: true,
             schemas,
+            filter: None,
         };
 
         self.header.write(&mut archive_writer)?;
@@ -5009,6 +5032,7 @@ pub struct SaveReader {
     log: bool,
     error_to_raw: bool,
     types: Option<Rc<Types>>,
+    filter: Option<Rc<PropertyFilter>>,
 }
 impl Default for SaveReader {
     fn default() -> Self {
@@ -5021,6 +5045,7 @@ impl SaveReader {
             log: false,
             error_to_raw: false,
             types: None,
+            filter: None,
         }
     }
     pub fn log(mut self, log: bool) -> Self {
@@ -5043,11 +5068,26 @@ impl SaveReader {
         self.types = Some(Rc::new(types));
         self
     }
+    /// Only read the properties at these paths (dot-joined, as for [`Types`]) and
+    /// whatever contains them. Other properties are skipped using the size in their
+    /// tag, without being parsed, and are left out of the result. Much faster when
+    /// only a few values are needed. Schemas are only recorded for properties read,
+    /// so a filtered save cannot be written back out.
+    pub fn only(mut self, paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.filter = Some(Rc::new(PropertyFilter::new(paths)));
+        self
+    }
+    /// Read a save from any reader. The stream is buffered so it can be seeked; use
+    /// [`read_seekable`](Self::read_seekable) for streams that can already seek.
     pub fn read<S: Read>(self, stream: S) -> Result<Save, ParseError> {
+        self.read_seekable(SeekReader::new(stream))
+    }
+    /// Read a save from a seekable stream, such as a `Cursor` over bytes in memory or a
+    /// [`CompressedReader`], without buffering it. Skipped properties are seeked over.
+    pub fn read_seekable<S: Read + Seek>(self, stream: S) -> Result<Save, ParseError> {
         let types = self.types.unwrap_or_else(|| Rc::new(Types::new()));
         let schemas = Rc::new(RefCell::new(PropertySchemas::new()));
 
-        let stream = SeekReader::new(stream);
         let mut reader = SaveGameArchive {
             stream,
             version: None,
@@ -5056,6 +5096,7 @@ impl SaveReader {
             log: self.log,
             error_to_raw: self.error_to_raw,
             schemas: schemas.clone(),
+            filter: self.filter,
         };
 
         let result = || -> Result<_> {
