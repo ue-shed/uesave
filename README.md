@@ -27,12 +27,20 @@
 >   without decompressing most of it. WASM: `compressed_sav_to_json`,
 >   `compressed_sav_to_json_only`, and `sav_property_bytes` to get a byte array
 >   property (such as a compressed payload) without converting the save to JSON.
+> - WASM `ParsedSave` parses once and keeps the save in WASM memory, to query by path
+>   (`keys`, `json`) instead of converting all of it to JSON.
 > - Lengths read from a save no longer reserve memory up front. A misparsed property
 >   could reserve gigabytes before falling back to raw bytes, which aborts 32-bit WASM.
 >
+> The WASM build is published to npm as
+> [`@ue-shed/uesave-wasm`](https://www.npmjs.com/package/@ue-shed/uesave-wasm), versioned
+> with the Cargo workspace and tagged `ue-shed-v<version>` (upstream uses `v<version>`).
+> `node scripts/build-npm.mjs` builds the package into `uesave_wasm/pkg`; pack and publish
+> from there, from the exact release commit.
+>
 > The tag `tools-wasm-2026-04-21` is the exact source of the WASM build vendored in
-> Stairway Games' Tools: upstream `ab53b2c` plus the hints change. Rebuild it with
-> `wasm-pack build uesave_wasm --target web --release`.
+> Stairway Games' Tools until then: upstream `ab53b2c` plus the hints change. Rebuild it
+> with `wasm-pack build uesave_wasm --target web --release`.
 >
 > The crates.io and docs.rs badges below refer to upstream's published `uesave` crate.
 > This fork does not publish to crates.io.
