@@ -28,6 +28,7 @@ match save.root.properties["NumberOfGamesPlayed"] {
 */
 
 mod archive;
+mod compressed;
 mod context;
 mod error;
 mod serialization;
@@ -36,7 +37,8 @@ mod serialization;
 mod tests;
 
 pub use archive::{ArchiveReader, ArchiveType, ArchiveWriter, SaveGameArchiveType};
-pub use context::{PropertySchemas, SaveGameArchive, Scope, Types};
+pub use compressed::CompressedReader;
+pub use context::{PropertyFilter, PropertySchemas, SaveGameArchive, Scope, Types};
 pub use error::{Error, ParseError};
 
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
@@ -53,6 +55,8 @@ use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use tracing::instrument;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+const READ_AHEAD_BYTES: usize = 64 * 1024;
 
 struct SeekReader<R: Read> {
     inner: R,
@@ -85,15 +89,15 @@ impl<R: Read> SeekReader<R> {
 
         let needed = min_bytes - available;
 
-        // Reserve space for the additional bytes we need to read
-        self.buffer.reserve(needed);
-
-        // Read more data from the underlying reader
-        let mut temp_buf = vec![0; needed];
+        // Read ahead in large chunks straight into the buffer, so that small reads
+        // (single bytes, u32s) don't each allocate and call into the inner reader.
+        // Only wait for `needed` bytes; the read-ahead takes whatever is available.
+        let start = self.buffer.len();
+        self.buffer.resize(start + needed.max(READ_AHEAD_BYTES), 0);
         let mut total_read = 0;
 
-        while total_read < needed && !self.reached_eof {
-            let bytes_read = self.inner.read(&mut temp_buf[total_read..])?;
+        while total_read < needed {
+            let bytes_read = self.inner.read(&mut self.buffer[start + total_read..])?;
             if bytes_read == 0 {
                 self.reached_eof = true;
                 break;
@@ -101,8 +105,7 @@ impl<R: Read> SeekReader<R> {
             total_read += bytes_read;
         }
 
-        // Append the read data to our buffer
-        self.buffer.extend_from_slice(&temp_buf[..total_read]);
+        self.buffer.truncate(start + total_read);
 
         Ok(())
     }
@@ -172,7 +175,7 @@ impl<R: Read> Read for SeekReader<R> {
         }
 
         // Ensure we have data available
-        self.ensure_buffered(1)?;
+        self.ensure_buffered(buf.len())?;
 
         // Copy data from our buffer to the output buffer
         let available = self.buffer.len() - self.position;
@@ -214,10 +217,12 @@ pub fn read_string<A: ArchiveReader>(ar: &mut A) -> Result<String> {
         let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
         Ok(String::from_utf16(&chars[..length]).unwrap())
     } else {
-        let mut chars = vec![0; len as usize];
-        ar.read_exact(&mut chars)?;
+        let mut chars = read_bytes(ar, len as usize)?;
         let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-        Ok(String::from_utf8_lossy(&chars[..length]).into_owned())
+        chars.truncate(length);
+        // Reuse the buffer when it is valid UTF-8; only invalid input pays for the lossy copy.
+        Ok(String::from_utf8(chars)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
     }
 }
 #[cfg_attr(feature = "tracing", instrument(skip(ar)))]
@@ -231,6 +236,23 @@ pub fn write_string<A: ArchiveWriter>(ar: &mut A, string: &str) -> Result<()> {
 }
 
 #[cfg_attr(feature = "tracing", instrument(skip_all))]
+/// Longest string [`read_string_with`] reads without allocating.
+const SHORT_STRING_BYTES: usize = 64;
+
+/// Read a string like [`read_string`] and pass it to `f`, without allocating when it is
+/// short UTF-8, as type names are. For strings that are only matched, not kept.
+fn read_string_with<A: ArchiveReader, T>(ar: &mut A, f: impl FnOnce(&str) -> T) -> Result<T> {
+    let len = ar.read_i32::<LE>()?;
+    if (0..=SHORT_STRING_BYTES as i32).contains(&len) {
+        let mut buffer = [0; SHORT_STRING_BYTES];
+        let chars = &mut buffer[..len as usize];
+        ar.read_exact(chars)?;
+        let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+        return Ok(f(&String::from_utf8_lossy(&chars[..length])));
+    }
+    ar.seek(std::io::SeekFrom::Current(-4))?;
+    Ok(f(&ar.read_string()?))
+}
 fn read_string_trailing<A: ArchiveReader>(ar: &mut A) -> Result<(String, Vec<u8>)> {
     let len = ar.read_i32::<LE>()?;
     if len < 0 {
@@ -407,12 +429,20 @@ pub fn write_properties_none_terminated<T: ArchiveType, A: ArchiveWriter<Archive
 fn read_property<T: ArchiveType, A: ArchiveReader<ArchiveType = T>>(
     ar: &mut A,
 ) -> Result<Option<(PropertyKey, Property<T>)>> {
-    if let Some(mut tag) = PropertyTagFull::read(ar)? {
-        let tag_name = tag.name.to_string();
-        ar.scope().push(&tag_name);
-        let result = Property::read(ar, tag.clone());
-        ar.scope().pop();
-        let (value, updated_tag_data) = result?;
+    while let Some(mut tag) = PropertyTagFull::read(ar)? {
+        ar.scope().push(&tag.name);
+        if ar.skip_property() {
+            ar.scope().pop();
+            ar.seek(std::io::SeekFrom::Current(tag.size as i64))?;
+            continue;
+        }
+        let (value, updated_tag_data) = match Property::read(ar, &tag) {
+            Ok(result) => result,
+            Err(e) => {
+                ar.scope().pop();
+                return Err(e);
+            }
+        };
 
         // If type information was refined during reading (e.g., array of structs in older UE versions),
         // update the tag data and record the complete schema
@@ -420,17 +450,15 @@ fn read_property<T: ArchiveType, A: ArchiveReader<ArchiveType = T>>(
             tag.data = new_data;
         }
 
-        let key = PropertyKey(tag.index, tag_name.clone());
+        let key = PropertyKey(tag.index, std::mem::take(&mut tag.name).into_owned());
 
         // Record the final, complete schema
-        ar.scope().push(&tag_name);
-        ar.record_schema(ar.path().to_string(), tag.into_partial());
+        ar.record_schema_at_scope(tag.into_partial());
         ar.scope().pop();
 
-        Ok(Some((key, value)))
-    } else {
-        Ok(None)
+        return Ok(Some((key, value)));
     }
+    Ok(None)
 }
 #[cfg_attr(feature = "tracing", instrument(skip_all))]
 fn write_property<T: ArchiveType, A: ArchiveWriter<ArchiveType = T>>(
@@ -471,12 +499,36 @@ fn write_property<T: ArchiveType, A: ArchiveWriter<ArchiveType = T>>(
     result
 }
 
+/// Most elements to reserve up front for a length read from the save. Lengths are
+/// untrusted, and under `error_to_raw` a misparsed property yields garbage lengths
+/// before the fallback kicks in; reserving for those can claim gigabytes (fatal in
+/// 32-bit WASM, whose memory never shrinks). Vecs grow as elements actually arrive.
+const MAX_PREALLOCATED: usize = 4096;
+
+/// Read exactly `len` bytes without reserving more than the data actually holds.
+fn read_bytes<R: Read + ?Sized>(r: &mut R, len: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(len.min(MAX_PREALLOCATED * 256));
+    r.take(len as u64).read_to_end(&mut bytes)?;
+    if bytes.len() != len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        )
+        .into());
+    }
+    Ok(bytes)
+}
+
 #[cfg_attr(feature = "tracing", instrument(skip_all))]
 fn read_array<T, F, A: ArchiveReader>(length: u32, ar: &mut A, f: F) -> Result<Vec<T>>
 where
     F: Fn(&mut A) -> Result<T>,
 {
-    (0..length).map(|_| f(ar)).collect()
+    let mut items = Vec::with_capacity((length as usize).min(MAX_PREALLOCATED));
+    for _ in 0..length {
+        items.push(f(ar)?);
+    }
+    Ok(items)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1156,7 +1208,7 @@ macro_rules! define_property_types {
 
             #[cfg_attr(feature = "tracing", instrument(name = "PropertyType_read", skip_all))]
             fn read<A: ArchiveReader>(ar: &mut A) -> Result<Self> {
-                Self::try_from(&ar.read_string()?)
+                read_string_with(ar, Self::try_from)?
             }
 
             fn try_from(name: &str) -> Result<Self> {
@@ -1264,7 +1316,7 @@ macro_rules! define_struct_types {
 
             #[cfg_attr(feature = "tracing", instrument(name = "StructType_read", skip_all))]
             fn read<A: ArchiveReader>(ar: &mut A) -> Result<Self> {
-                Ok(ar.read_string()?.into())
+                read_string_with(ar, |name| StructType::from(name))
             }
 
             fn write<A: ArchiveWriter>(&self, ar: &mut A) -> Result<()> {
@@ -2173,7 +2225,7 @@ impl FMovieSceneFloatChannel {
             )));
         }
         let times_count = ar.read_i32::<LE>()? as usize;
-        let mut times = Vec::with_capacity(times_count);
+        let mut times = Vec::with_capacity(times_count.min(MAX_PREALLOCATED));
         for _ in 0..times_count {
             times.push(ar.read_i32::<LE>()?);
         }
@@ -2186,7 +2238,7 @@ impl FMovieSceneFloatChannel {
             )));
         }
         let values_count = ar.read_i32::<LE>()? as usize;
-        let mut values = Vec::with_capacity(values_count);
+        let mut values = Vec::with_capacity(values_count.min(MAX_PREALLOCATED));
         for _ in 0..values_count {
             let value = ar.read_f32::<LE>()?.into();
             let arrive_tangent = ar.read_f32::<LE>()?.into();
@@ -2617,22 +2669,24 @@ impl FMovieSceneEvaluationFieldEntityTree {
     fn read<A: ArchiveReader>(ar: &mut A) -> Result<Self> {
         let root_node = FMovieSceneEvaluationTreeNode::read(ar)?;
         let child_nodes_entries_count = ar.read_u32::<LE>()? as usize;
-        let mut child_nodes_entries = Vec::with_capacity(child_nodes_entries_count);
+        let mut child_nodes_entries =
+            Vec::with_capacity(child_nodes_entries_count.min(MAX_PREALLOCATED));
         for _ in 0..child_nodes_entries_count {
             child_nodes_entries.push(FEvaluationTreeEntry::read(ar)?);
         }
         let child_nodes_items_count = ar.read_u32::<LE>()? as usize;
-        let mut child_nodes_items = Vec::with_capacity(child_nodes_items_count);
+        let mut child_nodes_items =
+            Vec::with_capacity(child_nodes_items_count.min(MAX_PREALLOCATED));
         for _ in 0..child_nodes_items_count {
             child_nodes_items.push(FMovieSceneEvaluationTreeNode::read(ar)?);
         }
         let data_entries_count = ar.read_u32::<LE>()? as usize;
-        let mut data_entries = Vec::with_capacity(data_entries_count);
+        let mut data_entries = Vec::with_capacity(data_entries_count.min(MAX_PREALLOCATED));
         for _ in 0..data_entries_count {
             data_entries.push(FEvaluationTreeEntry::read(ar)?);
         }
         let data_items_count = ar.read_u32::<LE>()? as usize;
-        let mut data_items = Vec::with_capacity(data_items_count);
+        let mut data_items = Vec::with_capacity(data_items_count.min(MAX_PREALLOCATED));
         for _ in 0..data_items_count {
             data_items.push(FEntityAndMetaDataIndex::read(ar)?);
         }
@@ -2753,7 +2807,7 @@ impl FNiagaraDataInterfaceGeneratedFunction {
         let definition_name = ar.read_string()?;
         let instance_name = read_string(ar)?;
         let count = ar.read_i32::<LE>()? as usize;
-        let mut specifiers = Vec::with_capacity(count);
+        let mut specifiers = Vec::with_capacity(count.min(MAX_PREALLOCATED));
         for _ in 0..count {
             specifiers.push((ar.read_string()?, ar.read_string()?));
         }
@@ -2787,7 +2841,7 @@ impl FNiagaraDataInterfaceGPUParamInfo {
         let data_interface_hlsl_symbol = read_string(ar)?;
         let di_class_name = read_string(ar)?;
         let count = ar.read_i32::<LE>()? as usize;
-        let mut generated_functions = Vec::with_capacity(count);
+        let mut generated_functions = Vec::with_capacity(count.min(MAX_PREALLOCATED));
         for _ in 0..count {
             generated_functions.push(FNiagaraDataInterfaceGeneratedFunction::read(ar)?);
         }
@@ -2878,12 +2932,12 @@ impl<T: ArchiveType> FClothLODDataCommon<T> {
     fn read<A: ArchiveReader<ArchiveType = T>>(ar: &mut A) -> Result<Self> {
         let properties = read_properties_until_none(ar)?;
         let up_count = ar.read_i32::<LE>()? as usize;
-        let mut transition_up_skin_data = Vec::with_capacity(up_count);
+        let mut transition_up_skin_data = Vec::with_capacity(up_count.min(MAX_PREALLOCATED));
         for _ in 0..up_count {
             transition_up_skin_data.push(FMeshToMeshVertData::read(ar)?);
         }
         let down_count = ar.read_i32::<LE>()? as usize;
-        let mut transition_down_skin_data = Vec::with_capacity(down_count);
+        let mut transition_down_skin_data = Vec::with_capacity(down_count.min(MAX_PREALLOCATED));
         for _ in 0..down_count {
             transition_down_skin_data.push(FMeshToMeshVertData::read(ar)?);
         }
@@ -2922,8 +2976,7 @@ impl<T: ArchiveType> FNiagaraVariable<T> {
         let type_def = read_properties_until_none(ar)?;
         ar.scope().pop();
         let count = ar.read_u32::<LE>()? as usize;
-        let mut var_data = vec![0u8; count];
-        ar.read_exact(&mut var_data)?;
+        let var_data = read_bytes(ar, count)?;
         Ok(Self {
             name,
             type_def,
@@ -3662,8 +3715,7 @@ impl Text {
                 generator_type_id: ar.read_string()?,
                 generator_contents: {
                     let len = ar.read_u32::<LE>()? as usize;
-                    let mut bytes = vec![0; len];
-                    ar.read_exact(&mut bytes)?;
+                    let bytes = read_bytes(ar, len)?;
                     bytes
                 },
             }),
@@ -4142,11 +4194,8 @@ impl<T: ArchiveType> ValueVec<T> {
             }
             PropertyType::ByteProperty => {
                 if size == count {
-                    ValueVec::Byte(ByteArray::Byte(read_array(
-                        count,
-                        ar,
-                        |r| Ok(r.read_u8()?),
-                    )?))
+                    let bytes = read_bytes(ar, count as usize)?;
+                    ValueVec::Byte(ByteArray::Byte(bytes))
                 } else {
                     ValueVec::Byte(ByteArray::Label(read_array(count, ar, |r| {
                         r.read_string()
@@ -4478,7 +4527,7 @@ impl<T: ArchiveType> Property<T> {
     #[cfg_attr(feature = "tracing", instrument(name = "Property_read", skip_all))]
     fn read<A: ArchiveReader<ArchiveType = T>>(
         ar: &mut A,
-        tag: PropertyTagFull,
+        tag: &PropertyTagFull,
     ) -> Result<(Property<T>, Option<PropertyTagDataFull>)> {
         if tag.data.has_raw_struct() {
             if ar.log() {
@@ -4488,15 +4537,14 @@ impl<T: ArchiveType> Property<T> {
                     tag.data,
                 );
             }
-            let mut raw = vec![0; tag.size as usize];
-            ar.read_exact(&mut raw)?;
+            let raw = read_bytes(ar, tag.size as usize)?;
             return Ok((Property::Raw(raw), None));
         }
         // Save the current position before attempting to parse
         let start_position = ar.stream_position()?;
 
         // Try to parse the property directly from the stream
-        let (inner, updated_tag_data) = match Self::try_read_inner(ar, &tag) {
+        let (inner, updated_tag_data) = match Self::try_read_inner(ar, tag) {
             Ok(result) => result,
             Err(e) => {
                 // Check if we should convert errors to raw properties
@@ -4506,8 +4554,7 @@ impl<T: ArchiveType> Property<T> {
                         eprintln!("Warning: Failed to parse property '{}': {}", ar.path(), e);
                     }
                     ar.seek(std::io::SeekFrom::Start(start_position))?;
-                    let mut property_data = vec![0u8; tag.size as usize];
-                    ar.read_exact(&mut property_data)?;
+                    let property_data = read_bytes(ar, tag.size as usize)?;
                     (Property::Raw(property_data), None)
                 } else {
                     // Error mode: return the error immediately
@@ -4969,6 +5016,7 @@ impl Save {
             log: false,
             error_to_raw: true,
             schemas,
+            filter: None,
         };
 
         self.header.write(&mut archive_writer)?;
@@ -4984,6 +5032,7 @@ pub struct SaveReader {
     log: bool,
     error_to_raw: bool,
     types: Option<Rc<Types>>,
+    filter: Option<Rc<PropertyFilter>>,
 }
 impl Default for SaveReader {
     fn default() -> Self {
@@ -4996,6 +5045,7 @@ impl SaveReader {
             log: false,
             error_to_raw: false,
             types: None,
+            filter: None,
         }
     }
     pub fn log(mut self, log: bool) -> Self {
@@ -5018,11 +5068,26 @@ impl SaveReader {
         self.types = Some(Rc::new(types));
         self
     }
+    /// Only read the properties at these paths (dot-joined, as for [`Types`]) and
+    /// whatever contains them. Other properties are skipped using the size in their
+    /// tag, without being parsed, and are left out of the result. Much faster when
+    /// only a few values are needed. Schemas are only recorded for properties read,
+    /// so a filtered save cannot be written back out.
+    pub fn only(mut self, paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.filter = Some(Rc::new(PropertyFilter::new(paths)));
+        self
+    }
+    /// Read a save from any reader. The stream is buffered so it can be seeked; use
+    /// [`read_seekable`](Self::read_seekable) for streams that can already seek.
     pub fn read<S: Read>(self, stream: S) -> Result<Save, ParseError> {
+        self.read_seekable(SeekReader::new(stream))
+    }
+    /// Read a save from a seekable stream, such as a `Cursor` over bytes in memory or a
+    /// [`CompressedReader`], without buffering it. Skipped properties are seeked over.
+    pub fn read_seekable<S: Read + Seek>(self, stream: S) -> Result<Save, ParseError> {
         let types = self.types.unwrap_or_else(|| Rc::new(Types::new()));
         let schemas = Rc::new(RefCell::new(PropertySchemas::new()));
 
-        let stream = SeekReader::new(stream);
         let mut reader = SaveGameArchive {
             stream,
             version: None,
@@ -5031,6 +5096,7 @@ impl SaveReader {
             log: self.log,
             error_to_raw: self.error_to_raw,
             schemas: schemas.clone(),
+            filter: self.filter,
         };
 
         let result = || -> Result<_> {

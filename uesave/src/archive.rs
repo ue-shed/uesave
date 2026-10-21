@@ -59,6 +59,12 @@ pub trait ArchiveReader: Read + Seek {
     /// Record a property schema at the given path
     fn record_schema(&mut self, path: String, tag: PropertyTagPartial);
 
+    /// Record a property schema at the current scope path
+    fn record_schema_at_scope(&mut self, tag: PropertyTagPartial) {
+        let path = self.path();
+        self.record_schema(path, tag);
+    }
+
     /// Get the current property path in the scope hierarchy
     fn path(&self) -> String;
 
@@ -70,6 +76,11 @@ pub trait ArchiveReader: Read + Seek {
     /// Returns true if errors during property parsing should produce Raw properties instead of failing.
     /// When false, parsing errors will immediately return an error.
     fn error_to_raw(&self) -> bool {
+        false
+    }
+
+    /// Returns true if the property at the current scope should be skipped rather than read
+    fn skip_property(&self) -> bool {
         false
     }
 }
@@ -167,6 +178,12 @@ where
         self.schemas.borrow_mut().record(path, tag);
     }
 
+    fn record_schema_at_scope(&mut self, tag: PropertyTagPartial) {
+        self.schemas
+            .borrow_mut()
+            .record_at(self.scope.as_str(), tag);
+    }
+
     fn path(&self) -> String {
         self.scope.path()
     }
@@ -177,6 +194,12 @@ where
 
     fn error_to_raw(&self) -> bool {
         SaveGameArchive::error_to_raw(self)
+    }
+
+    fn skip_property(&self) -> bool {
+        self.filter
+            .as_ref()
+            .is_some_and(|filter| !filter.includes(self.scope.as_str()))
     }
 }
 impl<W> ArchiveWriter for SaveGameArchive<W>

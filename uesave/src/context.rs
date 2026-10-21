@@ -27,6 +27,34 @@ impl Types {
     }
 }
 
+/// Property paths to read, in the same dot-joined form as [`Types`] paths. A property
+/// whose path is neither kept nor on the way to a kept path is skipped using the size
+/// in its tag, without being parsed. Everything inside a kept path is read.
+#[derive(Debug, Default, Clone)]
+pub struct PropertyFilter {
+    paths: Vec<String>,
+}
+impl PropertyFilter {
+    /// Keep the properties at `paths` (and everything inside them)
+    pub fn new(paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            paths: paths.into_iter().map(Into::into).collect(),
+        }
+    }
+    /// Whether the property at `path` should be read
+    pub fn includes(&self, path: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|kept| is_within(path, kept) || is_within(kept, path))
+    }
+}
+
+/// Whether `path` is `scope` or a property inside it.
+fn is_within(path: &str, scope: &str) -> bool {
+    path.strip_prefix(scope)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 /// Storage for property schemas (tags) separated from property data.
 /// Maps property paths to their type metadata.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,6 +73,17 @@ impl PropertySchemas {
         self.schemas.insert(path, tag);
     }
 
+    /// Record a schema at the given path, only allocating the key the first time
+    /// the path is seen. Same result as [`record`](Self::record).
+    pub fn record_at(&mut self, path: &str, tag: PropertyTagPartial) {
+        match self.schemas.get_mut(path) {
+            Some(existing) => *existing = tag,
+            None => {
+                self.schemas.insert(path.to_owned(), tag);
+            }
+        }
+    }
+
     /// Get a schema at the given path
     pub fn get(&self, path: &str) -> Option<&PropertyTagPartial> {
         self.schemas.get(path)
@@ -58,9 +97,14 @@ impl PropertySchemas {
 
 /// Represents the current position in the property hierarchy as a stack of names.
 /// Used for looking up type hints in the Types map.
+///
+/// The dot-joined path is kept up to date as names are pushed and popped, so
+/// lookups borrow it instead of joining the components for every property.
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
-    components: Vec<String>,
+    path: String,
+    /// Length of `path` before each push, so `pop` can truncate back to it.
+    starts: Vec<usize>,
 }
 
 impl Scope {
@@ -69,15 +113,26 @@ impl Scope {
     }
 
     pub fn path(&self) -> String {
-        self.components.join(".")
+        self.path.clone()
+    }
+
+    /// The current path, borrowed.
+    pub fn as_str(&self) -> &str {
+        &self.path
     }
 
     pub fn push(&mut self, name: &str) {
-        self.components.push(name.to_string());
+        self.starts.push(self.path.len());
+        if self.starts.len() > 1 {
+            self.path.push('.');
+        }
+        self.path.push_str(name);
     }
 
     pub fn pop(&mut self) {
-        self.components.pop();
+        if let Some(start) = self.starts.pop() {
+            self.path.truncate(start);
+        }
     }
 }
 
@@ -90,6 +145,7 @@ pub struct SaveGameArchive<S> {
     pub(crate) log: bool,
     pub(crate) error_to_raw: bool,
     pub(crate) schemas: Rc<RefCell<PropertySchemas>>,
+    pub(crate) filter: Option<Rc<PropertyFilter>>,
 }
 impl<R: Read> Read for SaveGameArchive<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -123,6 +179,7 @@ impl<S> SaveGameArchive<S> {
             log: false,
             error_to_raw: false,
             schemas: Rc::new(RefCell::new(PropertySchemas::new())),
+            filter: None,
         }
     }
     pub(crate) fn run<F, T>(stream: S, f: F) -> T
@@ -135,7 +192,7 @@ impl<S> SaveGameArchive<S> {
         self.scope.path()
     }
     fn get_type(&self) -> Option<&StructType> {
-        self.types.types.get(&self.path())
+        self.types.types.get(self.scope.as_str())
     }
     pub fn set_version(&mut self, version: Header) {
         self.version = Some(version);
