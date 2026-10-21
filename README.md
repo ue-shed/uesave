@@ -1,5 +1,24 @@
 # uesave
 
+> **This is the UE Shed fork of [trumank/uesave](https://github.com/trumank/uesave).**
+> uesave is written and maintained by [Truman Kilen](https://github.com/trumank) and
+> contributors, and is MIT licensed (see [LICENSE](LICENSE)). All credit for the parser
+> goes to them. Please report parser bugs and send general improvements upstream.
+>
+> What this fork changes:
+>
+> - `uesave_wasm`'s `sav_to_json(data, hints_json)` takes a second argument: a JSON
+>   object mapping dot-joined property paths to `StructType` names, the same hints the
+>   CLI takes with `-t path=Type`. It lets browser callers parse game-specific `TMap`
+>   keys and struct arrays.
+>
+> The tag `tools-wasm-2026-04-21` is the exact source of the WASM build vendored in
+> Stairway Games' Tools: upstream `ab53b2c` plus the hints change. Rebuild it with
+> `wasm-pack build uesave_wasm --target web --release`.
+>
+> The crates.io and docs.rs badges below refer to upstream's published `uesave` crate.
+> This fork does not publish to crates.io.
+
 [![docs.rs](https://img.shields.io/docsrs/uesave)](https://docs.rs/uesave)
 [![Crates.io](https://img.shields.io/crates/v/uesave)](https://crates.io/crates/uesave)
 
