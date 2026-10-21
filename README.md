@@ -11,6 +11,12 @@
 >   object mapping dot-joined property paths to `StructType` names, the same hints the
 >   CLI takes with `-t path=Type`. It lets browser callers parse game-specific `TMap`
 >   keys and struct arrays.
+> - `sav_to_json` returns compact JSON instead of pretty-printed JSON.
+> - Faster parsing: the buffering reader reads ahead in chunks instead of one byte
+>   per refill, scope paths and schema records no longer allocate per property, and
+>   byte arrays and strings avoid extra copies.
+> - Lengths read from a save no longer reserve memory up front. A misparsed property
+>   could reserve gigabytes before falling back to raw bytes, which aborts 32-bit WASM.
 >
 > The tag `tools-wasm-2026-04-21` is the exact source of the WASM build vendored in
 > Stairway Games' Tools: upstream `ab53b2c` plus the hints change. Rebuild it with

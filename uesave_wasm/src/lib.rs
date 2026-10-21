@@ -38,7 +38,7 @@ pub fn sav_to_json(data: &[u8], hints_json: &str) -> Result<String, JsValue> {
         .read(Cursor::new(data))
         .map_err(|e| JsValue::from_str(&format!("{e}")))?;
 
-    serde_json::to_string_pretty(&save).map_err(|e| JsValue::from_str(&format!("{e}")))
+    serde_json::to_string(&save).map_err(|e| JsValue::from_str(&format!("{e}")))
 }
 
 #[wasm_bindgen]
