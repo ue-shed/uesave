@@ -612,6 +612,7 @@ name = "uesave_wasm"
 version = "0.7.1"
 dependencies = [
  "console_error_panic_hook",
+ "serde",
  "serde_json",
  "uesave",
  "wasm-bindgen",

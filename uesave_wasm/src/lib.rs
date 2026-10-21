@@ -6,6 +6,9 @@ use uesave::{
 };
 use wasm_bindgen::prelude::*;
 
+mod tree;
+pub use tree::ParsedSave;
+
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
@@ -113,6 +116,14 @@ fn read_to_json<S: Read + Seek>(
     hints_json: &str,
     paths: Option<Vec<String>>,
 ) -> Result<String, JsValue> {
+    serde_json::to_string(&read_save(stream, hints_json, paths)?).map_err(to_js)
+}
+
+fn read_save<S: Read + Seek>(
+    stream: S,
+    hints_json: &str,
+    paths: Option<Vec<String>>,
+) -> Result<Save, JsValue> {
     let mut types = Types::new();
     if !hints_json.trim().is_empty() {
         let hints: HashMap<String, String> = serde_json::from_str(hints_json)
@@ -126,9 +137,7 @@ fn read_to_json<S: Read + Seek>(
     if let Some(paths) = paths {
         reader = reader.only(paths);
     }
-    let save = reader.read_seekable(stream).map_err(to_js)?;
-
-    serde_json::to_string(&save).map_err(to_js)
+    reader.read_seekable(stream).map_err(to_js)
 }
 
 fn to_js(e: impl std::fmt::Display) -> JsValue {
