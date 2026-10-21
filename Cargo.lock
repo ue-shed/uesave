@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "uesave"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "uesave_cli"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "uesave_wasm"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "console_error_panic_hook",
  "serde",

@@ -3,3 +3,4 @@
 /web/dist
 node_modules
 web/.vite
+/uesave_wasm/pkg*/
