@@ -32,7 +32,7 @@ The type declarations use `Symbol.dispose` (`ParsedSave` is disposable), which n
 
 ## API
 
-All results are JSON strings in the shape uesave's JSON output uses: a property is named
+Results are JSON strings, or for `ParsedSave.value` JavaScript values, in the shape uesave's JSON output uses: a property is named
 `<name>_<index>`, structs are objects, arrays are lists, and maps are lists of `{ key, value }`.
 
 - `sav_to_json(data, hintsJson)` parses a whole save.
@@ -47,14 +47,25 @@ All results are JSON strings in the shape uesave's JSON output uses: a property 
   payload, without converting the save to JSON.
 - `new ParsedSave(data, hintsJson, pathsJson)` and `ParsedSave.fromCompressed(...)` parse once
   and keep the save in WebAssembly memory. Query it with `keys(pathJson)` (a node's children with
-  their kind and size) and `json(pathJson)` (one node), or `toJson()` for everything. Paths are
+  their kind and size), `json(pathJson)` (one node as JSON) or `value(pathJson)` (one node as a
+  JavaScript value, built without JSON text in between), or `toJson()` for everything. Paths are
   JSON arrays of segments, such as `["SaveData_0", "players_0", 0, "playerInfo_0"]`. Call
-  `free()` when done.
+  `free()` when done. Taking a large save one part at a time with `value` keeps memory low:
+  neither the whole JSON text nor the whole object tree exists at once. `value` keeps 32-bit
+  floats exact (`28812.8671875`), where JSON text has the shortest form (`28812.867`).
 - `json_to_sav(json)` writes a save back from full (unfiltered) JSON.
 
 **Hints** (`hintsJson`) map dot-joined property paths to uesave struct type names, for maps and
 struct arrays whose element types the save doesn't record, for example
 `{ "SaveData.tileSaveDataMap.savedEntryMap.Key": "Struct" }`. Pass `""` for none.
+
+One hint value isn't a type: `"Properties"` on a byte array (`TArray<uint8>`) decodes its bytes as
+a property list, for games that store a struct's tagged properties, or a whole object written with
+`UObject::Serialize`, in one. It reads as an object of properties instead of `{ "Byte": [...] }`;
+bytes that don't parse as a property list stay as they are. Its path is the one the reader is at,
+so inside a map's struct values it has no `Value` segment:
+`{ "SaveData.dynamicQuestDataMap.Data": "Properties" }`. A save read this way can't be written back
+with `json_to_sav`.
 
 **Paths** (`pathsJson`) are a JSON array of dot-joined property paths in the same form, for
 example `["SaveData.playerInfo", "SaveData.currentDate"]`. Map entries are transparent: a

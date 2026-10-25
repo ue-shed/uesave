@@ -9,6 +9,9 @@ use wasm_bindgen::prelude::*;
 mod tree;
 pub use tree::ParsedSave;
 
+/// The hint value that decodes a byte array as a property list (see `sav_to_json`).
+const NESTED_PROPERTIES: &str = "Properties";
+
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
@@ -26,6 +29,12 @@ pub fn init() {
 ///   - Known variant name ("DateTime", "Vector", "GameplayTagContainer", ...) → that variant
 ///   - "Struct"                                                               → Struct(None)
 ///   - anything else                                                          → Struct(Some(name))
+///
+/// One more value isn't a struct type: `"Properties"` on a byte array property (a
+/// `TArray<uint8>`) decodes its bytes as a property list, for games that store a struct's
+/// tagged properties in one. It then reads as an object of properties instead of
+/// `{"Byte": [...]}`, and the save can't be written back with `json_to_sav`. Bytes that
+/// don't parse as a property list are kept as they are.
 #[wasm_bindgen]
 pub fn sav_to_json(data: &[u8], hints_json: &str) -> Result<String, JsValue> {
     read_to_json(Cursor::new(data), hints_json, None)
@@ -125,15 +134,23 @@ fn read_save<S: Read + Seek>(
     paths: Option<Vec<String>>,
 ) -> Result<Save, JsValue> {
     let mut types = Types::new();
+    let mut nested = vec![];
     if !hints_json.trim().is_empty() {
         let hints: HashMap<String, String> = serde_json::from_str(hints_json)
             .map_err(|e| JsValue::from_str(&format!("invalid hints: {e}")))?;
         for (path, t) in hints {
-            types.add(path, StructType::from(t.as_str()));
+            if t == NESTED_PROPERTIES {
+                nested.push(path);
+            } else {
+                types.add(path, StructType::from(t.as_str()));
+            }
         }
     }
 
     let mut reader = SaveReader::new().error_to_raw(true).types(types);
+    if !nested.is_empty() {
+        reader = reader.nested(nested);
+    }
     if let Some(paths) = paths {
         reader = reader.only(paths);
     }

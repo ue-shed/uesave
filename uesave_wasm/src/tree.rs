@@ -70,6 +70,23 @@ impl ParsedSave {
         json.map_err(to_js)
     }
 
+    /// The value at `path` as a JavaScript value, built straight from the parsed save
+    /// with no JSON text in between: the same shape as `JSON.parse(json(path))`, except
+    /// that 32-bit floats keep their exact value (`28812.8671875` rather than
+    /// `28812.867`). Reading a large save part by part this way keeps memory low.
+    pub fn value(&self, path_json: &str) -> Result<JsValue, JsValue> {
+        let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+        let node = self.find(path_json)?;
+        let value = match node {
+            Node::Properties(p) => p.serialize(&serializer),
+            Node::Property(p) => p.serialize(&serializer),
+            Node::Struct(s) => s.serialize(&serializer),
+            Node::Entry(e) => e.serialize(&serializer),
+            Node::Leaf(v) => v.serialize(&serializer),
+        };
+        value.map_err(to_js)
+    }
+
     /// The children of the value at `path`, without their contents: a JSON array of
     /// `{ key, kind, len }`, where `key` is the next path segment, `kind` names the
     /// value's type, and `len` counts its children (absent for plain values). Plain
@@ -141,6 +158,9 @@ impl<'a> Node<'a> {
                     .map(|(_, value)| Node::Property(value))
             }
             Node::Property(Property::Struct(s)) => Node::Struct(s).child(segment),
+            Node::Property(Property::Array(ValueVec::Properties(props))) => {
+                Node::Properties(props).child(segment)
+            }
             Node::Property(Property::Array(v) | Property::Set(v)) => {
                 vec_item(v, segment.as_u64()? as usize)
             }
@@ -172,6 +192,11 @@ fn vec_item(values: &ValueVec, index: usize) -> Option<Node<'_>> {
 
 fn vec_children(values: &ValueVec) -> Vec<Value> {
     match values {
+        ValueVec::Properties(props) => props
+            .0
+            .iter()
+            .map(|(key, value)| describe(json!(format!("{}_{}", key.1, key.0)), value))
+            .collect(),
         ValueVec::Struct(items) => items
             .iter()
             .enumerate()
@@ -202,6 +227,7 @@ fn struct_children(s: &StructValue) -> Vec<Value> {
 fn describe(key: Value, property: &Property) -> Value {
     let (kind, len) = match property {
         Property::Struct(s) => return describe_struct(key, s),
+        Property::Array(ValueVec::Properties(props)) => ("Struct", Some(props.0.len())),
         Property::Array(v) => ("Array", Some(vec_len(v))),
         Property::Set(v) => ("Set", Some(vec_len(v))),
         Property::Map(entries) => ("Map", Some(entries.len())),
@@ -245,6 +271,7 @@ fn vec_len(values: &ValueVec) -> usize {
         ValueVec::Box(v) => v.len(),
         ValueVec::Box2D(v) => v.len(),
         ValueVec::Struct(v) => v.len(),
+        ValueVec::Properties(v) => v.0.len(),
     }
 }
 

@@ -49,6 +49,26 @@ impl PropertyFilter {
     }
 }
 
+/// Paths of byte array properties that hold a serialized property list, as games do
+/// when they store a struct with `UStruct::SerializeTaggedProperties` into a
+/// `TArray<uint8>`. Paths match exactly, in the same dot-joined form as [`Types`].
+#[derive(Debug, Default, Clone)]
+pub struct NestedProperties {
+    paths: std::collections::HashSet<String>,
+}
+impl NestedProperties {
+    /// Decode the byte arrays at `paths`
+    pub fn new(paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            paths: paths.into_iter().map(Into::into).collect(),
+        }
+    }
+    /// Whether the byte array at `path` should be decoded
+    pub fn includes(&self, path: &str) -> bool {
+        self.paths.contains(path)
+    }
+}
+
 /// Whether `path` is `scope` or a property inside it.
 fn is_within(path: &str, scope: &str) -> bool {
     path.strip_prefix(scope)
@@ -146,6 +166,7 @@ pub struct SaveGameArchive<S> {
     pub(crate) error_to_raw: bool,
     pub(crate) schemas: Rc<RefCell<PropertySchemas>>,
     pub(crate) filter: Option<Rc<PropertyFilter>>,
+    pub(crate) nested: Option<Rc<NestedProperties>>,
 }
 impl<R: Read> Read for SaveGameArchive<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -180,6 +201,7 @@ impl<S> SaveGameArchive<S> {
             error_to_raw: false,
             schemas: Rc::new(RefCell::new(PropertySchemas::new())),
             filter: None,
+            nested: None,
         }
     }
     pub(crate) fn run<F, T>(stream: S, f: F) -> T

@@ -38,7 +38,9 @@ mod tests;
 
 pub use archive::{ArchiveReader, ArchiveType, ArchiveWriter, SaveGameArchiveType};
 pub use compressed::CompressedReader;
-pub use context::{PropertyFilter, PropertySchemas, SaveGameArchive, Scope, Types};
+pub use context::{
+    NestedProperties, PropertyFilter, PropertySchemas, SaveGameArchive, Scope, Types,
+};
 pub use error::{Error, ParseError};
 
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
@@ -3991,6 +3993,9 @@ pub enum ValueVec<T: ArchiveType = SaveGameArchiveType> {
     Box(Vec<Box>),
     Box2D(Vec<Box2D>),
     Struct(Vec<StructValue<T>>),
+    /// A byte array decoded as a property list (see [`SaveReader::nested`]). Read only:
+    /// a save holding one can't be written back out.
+    Properties(Properties<T>),
 }
 
 impl<T: ArchiveType> StructValue<T> {
@@ -4195,7 +4200,10 @@ impl<T: ArchiveType> ValueVec<T> {
             PropertyType::ByteProperty => {
                 if size == count {
                     let bytes = read_bytes(ar, count as usize)?;
-                    ValueVec::Byte(ByteArray::Byte(bytes))
+                    match ar.read_nested_properties(&bytes) {
+                        Some(properties) => ValueVec::Properties(properties),
+                        None => ValueVec::Byte(ByteArray::Byte(bytes)),
+                    }
                 } else {
                     ValueVec::Byte(ByteArray::Label(read_array(count, ar, |r| {
                         r.read_string()
@@ -4221,6 +4229,12 @@ impl<T: ArchiveType> ValueVec<T> {
     }
     fn write<A: ArchiveWriter<ArchiveType = T>>(&self, ar: &mut A) -> Result<()> {
         match &self {
+            ValueVec::Properties(_) => {
+                return Err(Error::Other(format!(
+                    "{}: a byte array decoded as properties can't be written back out",
+                    ar.path()
+                )))
+            }
             ValueVec::Int8(v) => {
                 ar.write_u32::<LE>(v.len() as u32)?;
                 for i in v {
@@ -5017,6 +5031,7 @@ impl Save {
             error_to_raw: true,
             schemas,
             filter: None,
+            nested: None,
         };
 
         self.header.write(&mut archive_writer)?;
@@ -5033,6 +5048,7 @@ pub struct SaveReader {
     error_to_raw: bool,
     types: Option<Rc<Types>>,
     filter: Option<Rc<PropertyFilter>>,
+    nested: Option<Rc<NestedProperties>>,
 }
 impl Default for SaveReader {
     fn default() -> Self {
@@ -5046,6 +5062,7 @@ impl SaveReader {
             error_to_raw: false,
             types: None,
             filter: None,
+            nested: None,
         }
     }
     pub fn log(mut self, log: bool) -> Self {
@@ -5077,6 +5094,20 @@ impl SaveReader {
         self.filter = Some(Rc::new(PropertyFilter::new(paths)));
         self
     }
+    /// Decode the byte arrays at these paths (dot-joined, matched exactly) as property
+    /// lists, for games that serialize a struct's tagged properties, or a whole object
+    /// with `UObject::Serialize`, into a `TArray<uint8>`. They read as
+    /// [`ValueVec::Properties`] instead of bytes; one that doesn't parse as a property
+    /// list stays as bytes. The object GUID flag `UObject::Serialize` writes after the
+    /// properties is read past and not kept. A save read this way can't be written back
+    /// out.
+    ///
+    /// Paths are the ones the reader is at: inside a map's struct values that is
+    /// `<map>.<field>`, without the `Key`/`Value` segment that struct type hints use.
+    pub fn nested(mut self, paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.nested = Some(Rc::new(NestedProperties::new(paths)));
+        self
+    }
     /// Read a save from any reader. The stream is buffered so it can be seeked; use
     /// [`read_seekable`](Self::read_seekable) for streams that can already seek.
     pub fn read<S: Read>(self, stream: S) -> Result<Save, ParseError> {
@@ -5097,6 +5128,7 @@ impl SaveReader {
             error_to_raw: self.error_to_raw,
             schemas: schemas.clone(),
             filter: self.filter,
+            nested: self.nested,
         };
 
         let result = || -> Result<_> {

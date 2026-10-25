@@ -83,6 +83,15 @@ pub trait ArchiveReader: Read + Seek {
     fn skip_property(&self) -> bool {
         false
     }
+
+    /// Decode `bytes`, the byte array at the current scope, as a property list when it
+    /// was asked for. `None` when it wasn't, or when the bytes don't parse as one.
+    fn read_nested_properties(
+        &mut self,
+        _bytes: &[u8],
+    ) -> Option<crate::Properties<Self::ArchiveType>> {
+        None
+    }
 }
 
 pub trait ArchiveWriter: Write + Seek {
@@ -200,6 +209,63 @@ where
         self.filter
             .as_ref()
             .is_some_and(|filter| !filter.includes(self.scope.as_str()))
+    }
+
+    fn read_nested_properties(&mut self, bytes: &[u8]) -> Option<crate::Properties> {
+        // An empty array holds nothing, not even the `None` a property list ends with.
+        if bytes.is_empty()
+            || !self
+                .nested
+                .as_ref()
+                .is_some_and(|nested| nested.includes(self.scope.as_str()))
+        {
+            return None;
+        }
+        // Read everything inside, with the same versions and hints, failing rather than
+        // falling back to raw values: a list that doesn't parse stays as bytes.
+        let mut inner = SaveGameArchive {
+            stream: std::io::Cursor::new(bytes),
+            version: self.version.clone(),
+            types: self.types.clone(),
+            scope: self.scope.clone(),
+            log: self.log,
+            error_to_raw: false,
+            schemas: self.schemas.clone(),
+            filter: None,
+            nested: self.nested.clone(),
+        };
+        let result = crate::read_properties_until_none(&mut inner);
+        let mut read = inner.stream.position();
+        // `UObject::Serialize` follows the properties with a 32-bit "has object GUID"
+        // flag and, when set, the GUID. Read past it; it isn't kept.
+        let rest = &bytes[(read as usize).min(bytes.len())..];
+        match rest {
+            [0, 0, 0, 0] => read += 4,
+            [1, 0, 0, 0, guid @ ..] if guid.len() == 16 => read += 20,
+            _ => {}
+        }
+        match result {
+            Ok(properties) if read == bytes.len() as u64 => Some(properties),
+            Ok(_) => {
+                if self.log {
+                    eprintln!(
+                        "\"{}\": property list ends after {read} of {} bytes, keeping bytes",
+                        self.scope.as_str(),
+                        bytes.len()
+                    );
+                }
+                None
+            }
+            Err(e) => {
+                if self.log {
+                    eprintln!(
+                        "\"{}\": not a property list at byte {read} ({e}), keeping bytes",
+                        self.scope.as_str()
+                    );
+                }
+                None
+            }
+        }
     }
 }
 impl<W> ArchiveWriter for SaveGameArchive<W>
