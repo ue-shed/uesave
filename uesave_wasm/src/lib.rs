@@ -140,6 +140,15 @@ fn read_save<S: Read + Seek>(
     hints_json: &str,
     paths: Option<Vec<String>>,
 ) -> Result<Save, JsValue> {
+    let mut reader = reader(hints_json)?.error_to_raw(true);
+    if let Some(paths) = paths {
+        reader = reader.only(paths);
+    }
+    reader.read_seekable(stream).map_err(to_js)
+}
+
+/// A reader with the type hints and nested paths in `hints_json`.
+fn reader(hints_json: &str) -> Result<SaveReader, JsValue> {
     let mut types = Types::new();
     let mut nested = vec![];
     if !hints_json.trim().is_empty() {
@@ -154,14 +163,11 @@ fn read_save<S: Read + Seek>(
         }
     }
 
-    let mut reader = SaveReader::new().error_to_raw(true).types(types);
+    let mut reader = SaveReader::new().types(types);
     if !nested.is_empty() {
         reader = reader.nested(nested);
     }
-    if let Some(paths) = paths {
-        reader = reader.only(paths);
-    }
-    reader.read_seekable(stream).map_err(to_js)
+    Ok(reader)
 }
 
 fn to_js(e: impl std::fmt::Display) -> JsValue {

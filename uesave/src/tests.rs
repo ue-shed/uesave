@@ -985,3 +985,99 @@ fn test_nested_properties_read_past_the_object_guid_flag() -> Result<()> {
     );
     Ok(())
 }
+
+/// A map of one entry whose struct keys are 8 bytes (an `FDateTime`, say), followed by an
+/// int property. Without a hint for the key, the reader guesses a 16-byte `Guid`.
+fn map_with_struct_keys_then_int() -> Vec<u8> {
+    let mut out = vec![];
+    push_string(&mut out, "Track");
+    push_string(&mut out, "MapProperty");
+    out.extend_from_slice(&20u32.to_le_bytes()); // size
+    out.extend_from_slice(&0u32.to_le_bytes()); // index
+    push_string(&mut out, "StructProperty");
+    push_string(&mut out, "IntProperty");
+    out.push(0); // no property GUID
+    out.extend_from_slice(&0u32.to_le_bytes()); // keys to remove
+    out.extend_from_slice(&1u32.to_le_bytes()); // entries
+    out.extend_from_slice(&638_433_186_405_150_000i64.to_le_bytes());
+    out.extend_from_slice(&7i32.to_le_bytes());
+    push_string(&mut out, "After");
+    push_string(&mut out, "IntProperty");
+    out.extend_from_slice(&4u64.to_le_bytes());
+    out.push(0);
+    out.extend_from_slice(&42i32.to_le_bytes());
+    push_string(&mut out, "None");
+    out
+}
+
+#[test]
+fn test_property_that_misreads_its_size_falls_back_alone() -> Result<()> {
+    let bytes = map_with_struct_keys_then_int();
+    let properties = run(&mut Cursor::new(&bytes), |reader| {
+        reader.error_to_raw = true;
+        read_properties_until_none(reader)
+    })?;
+    let values: Vec<_> = properties.0.into_values().collect();
+    // The guessed key reads 28 bytes of a 20-byte map: only the map is kept as bytes.
+    assert!(matches!(&values[0], Property::Raw(raw) if raw.len() == 20));
+    assert_eq!(values[1], Property::Int(42));
+    // Without raw fallback, the map fails right where it is.
+    let strict = run(&mut Cursor::new(&bytes), |reader| {
+        read_properties_until_none(reader)
+    });
+    assert!(strict.is_err_and(|e| e
+        .to_string()
+        .contains("read 28 bytes of a 20-byte property")));
+    Ok(())
+}
+
+#[test]
+fn test_read_properties_from_bytes() -> Result<()> {
+    // The same list `nested` decodes in place, read directly.
+    let Property::Array(ValueVec::Properties(expected)) = read_data(
+        &byte_array_property(&vanity_mastery_properties()),
+        &["Data"],
+    )?
+    else {
+        panic!("the byte array wasn't decoded");
+    };
+    let mut with_guid_flag = vanity_mastery_properties();
+    with_guid_flag.extend_from_slice(&0u32.to_le_bytes());
+    for bytes in [vanity_mastery_properties(), with_guid_flag] {
+        let read = SaveReader::new()
+            .read_properties(&bytes, &mock_header(), "Some.Blob")
+            .unwrap();
+        assert_eq!(read, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_read_properties_fails_on_bytes_that_are_not_a_list() {
+    let mut trailing = vanity_mastery_properties();
+    trailing.push(9);
+    let truncated = vanity_mastery_properties()[..20].to_vec();
+    for bytes in [trailing, truncated, b"junk".to_vec(), vec![]] {
+        let result = SaveReader::new().read_properties(&bytes, &mock_header(), "");
+        assert!(result.is_err(), "{bytes:?} read as {result:?}");
+    }
+}
+
+#[test]
+fn test_read_properties_applies_nested_paths_below_its_path() {
+    // A list holding a byte array `Data` that holds a list in turn.
+    let mut outer = byte_array_property(&vanity_mastery_properties());
+    push_string(&mut outer, "None");
+    let read = |nested: &str| {
+        let properties = SaveReader::new()
+            .nested([nested])
+            .read_properties(&outer, &mock_header(), "Wrapper.Blob")
+            .unwrap();
+        properties.0.into_values().next().unwrap()
+    };
+    assert!(matches!(
+        read("Wrapper.Blob.Data"),
+        Property::Array(ValueVec::Properties(_))
+    ));
+    assert!(matches!(read("Data"), Property::Array(ValueVec::Byte(_))));
+}

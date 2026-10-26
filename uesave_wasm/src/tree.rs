@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use uesave::{ByteArray, MapEntry, Properties, Property, PropertyKey, Save, StructValue, ValueVec};
 use wasm_bindgen::prelude::*;
 
-use crate::{open_compressed, parse_paths, read_save, to_js};
+use crate::{open_compressed, parse_paths, read_save, reader, to_js};
 
 #[wasm_bindgen]
 pub struct ParsedSave {
@@ -66,33 +66,38 @@ impl ParsedSave {
         let node = self.find(path_json)?;
         #[cfg(feature = "tracing")]
         let _span = tracing::info_span!(target: "uesave::perf", "wasm.serialize_json").entered();
-        let json = match node {
-            Node::Properties(p) => serde_json::to_string(p),
-            Node::Property(p) => serde_json::to_string(p),
-            Node::Struct(s) => serde_json::to_string(s),
-            Node::Entry(e) => serde_json::to_string(e),
-            Node::Leaf(v) => serde_json::to_string(&v),
-        };
-        json.map_err(to_js)
+        serde_json::to_string(&node).map_err(to_js)
     }
 
     /// The value at `path` as a JavaScript value, built straight from the parsed save
     /// with no JSON text in between: the same shape as `JSON.parse(json(path))`, except
     /// that 32-bit floats keep their exact value (`28812.8671875` rather than
     /// `28812.867`). Reading a large save part by part this way keeps memory low.
+    /// Integers past 2^53, such as `FDateTime` ticks, come out rounded to the nearest
+    /// double, as `JSON.parse` gives them.
     pub fn value(&self, path_json: &str) -> Result<JsValue, JsValue> {
-        let serializer = serde_wasm_bindgen::Serializer::json_compatible();
         let node = self.find(path_json)?;
         #[cfg(feature = "tracing")]
         let _span = tracing::info_span!(target: "uesave::perf", "wasm.serialize_js").entered();
-        let value = match node {
-            Node::Properties(p) => p.serialize(&serializer),
-            Node::Property(p) => p.serialize(&serializer),
-            Node::Struct(s) => s.serialize(&serializer),
-            Node::Entry(e) => e.serialize(&serializer),
-            Node::Leaf(v) => v.serialize(&serializer),
-        };
-        value.map_err(to_js)
+        to_js_value(&node)
+    }
+
+    /// Read a property list held in bytes with this save's versions, as a JavaScript
+    /// value shaped like `value`'s. For byte arrays a game wraps in a header of its own,
+    /// which the `"Properties"` hint can't decode: strip the header, then pass the rest.
+    /// `hints_json` is as for `sav_to_json`; `path` is where the bytes sit in the save,
+    /// dot-joined, so hints below it apply. Throws unless every byte is part of the list.
+    #[wasm_bindgen(js_name = readProperties)]
+    pub fn read_properties(
+        &self,
+        bytes: &[u8],
+        hints_json: &str,
+        path: &str,
+    ) -> Result<JsValue, JsValue> {
+        let properties = reader(hints_json)?
+            .read_properties(bytes, &self.save.header, path)
+            .map_err(to_js)?;
+        to_js_value(&properties)
     }
 
     /// The children of the value at `path`, without their contents: a JSON array of
@@ -160,6 +165,30 @@ enum Node<'a> {
     Entry(&'a MapEntry),
     /// One borrowed element, serialized only after resolving the path.
     Leaf(ArrayItem<'a>),
+}
+
+impl Serialize for Node<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Node::Properties(p) => p.serialize(serializer),
+            Node::Property(p) => p.serialize(serializer),
+            Node::Struct(s) => s.serialize(serializer),
+            Node::Entry(e) => e.serialize(serializer),
+            Node::Leaf(v) => v.serialize(serializer),
+        }
+    }
+}
+
+/// `value` as a JavaScript value, the same shape as `JSON.parse` of its JSON. A 64-bit
+/// integer past 2^53 isn't a JavaScript number, so a value holding one goes through JSON
+/// text instead, which rounds it to the nearest double as `JSON.parse` does.
+fn to_js_value(value: &impl Serialize) -> Result<JsValue, JsValue> {
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .or_else(|direct| {
+            let json = serde_json::to_string(value).map_err(|_| to_js(&direct))?;
+            js_sys::JSON::parse(&json)
+        })
 }
 
 impl<'a> Node<'a> {

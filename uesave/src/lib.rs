@@ -4577,8 +4577,22 @@ impl<T: ArchiveType> Property<T> {
         // Save the current position before attempting to parse
         let start_position = ar.stream_position()?;
 
-        // Try to parse the property directly from the stream
-        let (inner, updated_tag_data) = match Self::try_read_inner(ar, tag) {
+        // Try to parse the property directly from the stream. A value that doesn't use exactly
+        // the bytes its tag declares was read wrongly (a wrong type hint, say) even if nothing
+        // failed yet: treat it as failed here, rather than misreading what follows it and
+        // failing further up, where the fallback would take a whole enclosing property.
+        let result = Self::try_read_inner(ar, tag).and_then(|result| {
+            let read = ar.stream_position()? - start_position;
+            if read == tag.size as u64 {
+                Ok(result)
+            } else {
+                Err(Error::Other(format!(
+                    "read {read} bytes of a {}-byte property",
+                    tag.size
+                )))
+            }
+        });
+        let (inner, updated_tag_data) = match result {
             Ok(result) => result,
             Err(e) => {
                 // Check if we should convert errors to raw properties
@@ -5209,5 +5223,42 @@ impl SaveReader {
                 extra,
             })
             .map_err(|e| error::ParseError { offset, error: e })
+    }
+    /// Read a property list held in bytes, such as a byte array from a save that
+    /// [`nested`](Self::nested) can't decode on its own because the game wraps it in a
+    /// header of its own: strip the header, then pass the rest here. The list is tagged
+    /// properties up to `None`, optionally followed by the object GUID flag
+    /// `UObject::Serialize` writes; every byte must be read.
+    ///
+    /// `header` is the header of the save the bytes came from, for its versions. `path` is
+    /// where the bytes sit in that save, dot-joined as for [`Types`], so that this reader's
+    /// hints and nested paths below it apply; pass `""` for the root. Properties that fail
+    /// to parse become raw values only if [`error_to_raw`](Self::error_to_raw) is set;
+    /// otherwise the whole read fails.
+    pub fn read_properties(
+        self,
+        bytes: &[u8],
+        header: &Header,
+        path: &str,
+    ) -> Result<Properties, ParseError> {
+        let mut scope = Scope::root();
+        for segment in path.split('.').filter(|s| !s.is_empty()) {
+            scope.push(segment);
+        }
+        let mut reader = SaveGameArchive {
+            stream: Cursor::new(bytes),
+            version: Some(header.clone()),
+            types: self.types.unwrap_or_else(|| Rc::new(Types::new())),
+            scope,
+            log: self.log,
+            error_to_raw: self.error_to_raw,
+            schemas: Rc::new(RefCell::new(PropertySchemas::new())),
+            filter: None,
+            nested: self.nested,
+        };
+        archive::read_property_list(&mut reader).map_err(|error| error::ParseError {
+            offset: reader.stream.position() as usize,
+            error,
+        })
     }
 }

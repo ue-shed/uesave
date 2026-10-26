@@ -242,39 +242,44 @@ where
             filter: None,
             nested: self.nested.clone(),
         };
-        let result = crate::read_properties_until_none(&mut inner);
-        let mut read = inner.stream.position();
-        // `UObject::Serialize` follows the properties with a 32-bit "has object GUID"
-        // flag and, when set, the GUID. Read past it; it isn't kept.
-        let rest = &bytes[(read as usize).min(bytes.len())..];
-        match rest {
-            [0, 0, 0, 0] => read += 4,
-            [1, 0, 0, 0, guid @ ..] if guid.len() == 16 => read += 20,
-            _ => {}
-        }
-        match result {
-            Ok(properties) if read == bytes.len() as u64 => Some(properties),
-            Ok(_) => {
-                if self.log {
-                    eprintln!(
-                        "\"{}\": property list ends after {read} of {} bytes, keeping bytes",
-                        self.scope.as_str(),
-                        bytes.len()
-                    );
-                }
-                None
-            }
+        match read_property_list(&mut inner) {
+            Ok(properties) => Some(properties),
             Err(e) => {
                 if self.log {
-                    eprintln!(
-                        "\"{}\": not a property list at byte {read} ({e}), keeping bytes",
-                        self.scope.as_str()
-                    );
+                    eprintln!("\"{}\": {e}, keeping bytes", self.scope.as_str());
                 }
                 None
             }
         }
     }
+}
+
+/// Read a property list that fills `ar`'s bytes: tagged properties up to `None`, then the
+/// 32-bit "has object GUID" flag `UObject::Serialize` writes after them and, when set, the
+/// GUID (read past, not kept). Fails unless every byte is read.
+pub(crate) fn read_property_list(
+    ar: &mut SaveGameArchive<std::io::Cursor<&[u8]>>,
+) -> Result<crate::Properties> {
+    let bytes = *ar.stream.get_ref();
+    let properties = crate::read_properties_until_none(ar).map_err(|e| {
+        crate::Error::Other(format!(
+            "not a property list at byte {} ({e})",
+            ar.stream.position()
+        ))
+    })?;
+    let mut read = ar.stream.position() as usize;
+    match &bytes[read.min(bytes.len())..] {
+        [0, 0, 0, 0] => read += 4,
+        [1, 0, 0, 0, guid @ ..] if guid.len() == 16 => read += 20,
+        _ => {}
+    }
+    if read != bytes.len() {
+        return Err(crate::Error::Other(format!(
+            "property list ends after {read} of {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(properties)
 }
 impl<W> ArchiveWriter for SaveGameArchive<W>
 where

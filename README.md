@@ -31,12 +31,24 @@
 >   (`keys`, `json`) instead of converting all of it to JSON.
 > - Lengths read from a save no longer reserve memory up front. A misparsed property
 >   could reserve gigabytes before falling back to raw bytes, which aborts 32-bit WASM.
+> - A property that reads more or fewer bytes than its tag declares counts as failed
+>   where it is. A wrong type hint used to misalign everything after it, so the raw
+>   fallback took a whole enclosing property instead.
+> - `SaveReader::nested(paths)` decodes byte arrays that hold a property list (a struct's
+>   tagged properties, or an object written with `UObject::Serialize`) in place. WASM:
+>   the `"Properties"` hint.
+> - `SaveReader::read_properties` reads such a list from bytes with a save's versions
+>   and hints, for byte arrays a game wraps in a header of its own: strip the header,
+>   then pass the rest. WASM: `ParsedSave.readProperties`.
+> - WASM `ParsedSave.value(path)` returns one node as a JavaScript value, with no JSON
+>   text in between.
 >
 > The WASM build is published to npm as
 > [`@ue-shed/uesave-wasm`](https://www.npmjs.com/package/@ue-shed/uesave-wasm), versioned
 > with the Cargo workspace and tagged `ue-shed-v<version>` (upstream uses `v<version>`).
-> `node scripts/build-npm.mjs` builds the package into `uesave_wasm/pkg`; pack and publish
-> from there, from the exact release commit.
+> `node scripts/build-npm.mjs` builds the package into `uesave_wasm/pkg`, and
+> `node --test "uesave_wasm/test/*.test.mjs"` then tests it; pack and publish from there,
+> from the exact release commit.
 >
 > The tag `tools-wasm-2026-04-21` is the exact source of the WASM build vendored in
 > Stairway Games' Tools until then: upstream `ab53b2c` plus the hints change. Rebuild it

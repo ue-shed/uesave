@@ -53,6 +53,12 @@ Results are JSON strings, or for `ParsedSave.value` JavaScript values, in the sh
   `free()` when done. Taking a large save one part at a time with `value` keeps memory low:
   neither the whole JSON text nor the whole object tree exists at once. `value` keeps 32-bit
   floats exact (`28812.8671875`), where JSON text has the shortest form (`28812.867`).
+  Integers past 2^53, such as `FDateTime` ticks, come out rounded as `JSON.parse` gives them.
+- `parsedSave.readProperties(bytes, hintsJson, path)` reads a property list held in bytes with
+  that save's versions, as a value shaped like `value`'s. It's for byte arrays a game wraps in a
+  header of its own, which the `"Properties"` hint (below) can't decode: strip the header and pass
+  the rest. `path` is where the bytes sit in the save, dot-joined, so hints below it apply. It
+  throws unless every byte is part of the list.
 - `json_to_sav(json)` writes a save back from full (unfiltered) JSON.
 
 **Hints** (`hintsJson`) map dot-joined property paths to uesave struct type names, for maps and
