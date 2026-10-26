@@ -808,6 +808,7 @@ impl<'de> Deserialize<'de> for Save {
                     schemas,
                     root,
                     extra,
+                    skipped: vec![],
                 })
             }
         }

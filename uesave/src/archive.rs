@@ -84,6 +84,9 @@ pub trait ArchiveReader: Read + Seek {
         false
     }
 
+    /// Note that the property at the current scope, `size` bytes, was skipped
+    fn record_skipped(&self, _size: u64) {}
+
     /// Decode `bytes`, the byte array at the current scope, as a property list when it
     /// was asked for. `None` when it wasn't, or when the bytes don't parse as one.
     fn read_nested_properties(
@@ -209,6 +212,12 @@ where
         self.filter
             .as_ref()
             .is_some_and(|filter| !filter.includes(self.scope.as_str()))
+    }
+
+    fn record_skipped(&self, size: u64) {
+        if let Some(filter) = &self.filter {
+            filter.record_skipped(self.scope.as_str(), size);
+        }
     }
 
     fn read_nested_properties(&mut self, bytes: &[u8]) -> Option<crate::Properties> {
