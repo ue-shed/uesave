@@ -237,12 +237,12 @@ pub fn write_string<A: ArchiveWriter>(ar: &mut A, string: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "tracing", instrument(skip_all))]
 /// Longest string [`read_string_with`] reads without allocating.
 const SHORT_STRING_BYTES: usize = 64;
 
 /// Read a string like [`read_string`] and pass it to `f`, without allocating when it is
 /// short UTF-8, as type names are. For strings that are only matched, not kept.
+#[cfg_attr(feature = "tracing", instrument(skip_all))]
 fn read_string_with<A: ArchiveReader, T>(ar: &mut A, f: impl FnOnce(&str) -> T) -> Result<T> {
     let len = ar.read_i32::<LE>()?;
     if (0..=SHORT_STRING_BYTES as i32).contains(&len) {
@@ -531,6 +531,26 @@ where
         items.push(f(ar)?);
     }
     Ok(items)
+}
+
+/// Decode fixed-width values in small blocks instead of reading each number separately.
+/// Reserve only a bounded number of elements until their bytes have actually been read.
+fn read_numeric_array<T, const N: usize, A: ArchiveReader>(
+    count: u32,
+    ar: &mut A,
+    decode: impl Fn([u8; N]) -> T,
+) -> Result<Vec<T>> {
+    let mut values = Vec::with_capacity((count as usize).min(MAX_PREALLOCATED));
+    let mut buffer = [0u8; 4096];
+    let mut remaining = count as usize;
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() / N);
+        let bytes = &mut buffer[..count * N];
+        ar.read_exact(bytes)?;
+        values.extend(bytes.chunks_exact(N).map(|v| decode(v.try_into().unwrap())));
+        remaining -= count;
+    }
+    Ok(values)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -935,7 +955,7 @@ impl PropertyTagFull<'_> {
 
             Ok(Some(tag))
         } else {
-            ar.scope().push(&name.clone());
+            ar.scope().push(&name);
             let result = (|| {
                 let type_ = PropertyType::read(ar)?;
                 let size = ar.read_u32::<LE>()?;
@@ -4165,37 +4185,37 @@ impl<T: ArchiveType> ValueVec<T> {
     ) -> Result<ValueVec<T>> {
         Ok(match t {
             PropertyType::Int8Property => {
-                ValueVec::Int8(read_array(count, ar, |r| Ok(r.read_i8()?))?)
+                ValueVec::Int8(read_numeric_array(count, ar, i8::from_le_bytes)?)
             }
             PropertyType::Int16Property => {
-                ValueVec::Int16(read_array(count, ar, |r| Ok(r.read_i16::<LE>()?))?)
+                ValueVec::Int16(read_numeric_array(count, ar, i16::from_le_bytes)?)
             }
             PropertyType::IntProperty => {
-                ValueVec::Int(read_array(count, ar, |r| Ok(r.read_i32::<LE>()?))?)
+                ValueVec::Int(read_numeric_array(count, ar, i32::from_le_bytes)?)
             }
             PropertyType::Int64Property => {
-                ValueVec::Int64(read_array(count, ar, |r| Ok(r.read_i64::<LE>()?))?)
+                ValueVec::Int64(read_numeric_array(count, ar, i64::from_le_bytes)?)
             }
             PropertyType::UInt8Property => {
-                ValueVec::UInt8(read_array(count, ar, |r| Ok(r.read_u8()?))?)
+                ValueVec::UInt8(read_numeric_array(count, ar, u8::from_le_bytes)?)
             }
             PropertyType::UInt16Property => {
-                ValueVec::UInt16(read_array(count, ar, |r| Ok(r.read_u16::<LE>()?))?)
+                ValueVec::UInt16(read_numeric_array(count, ar, u16::from_le_bytes)?)
             }
             PropertyType::UInt32Property => {
-                ValueVec::UInt32(read_array(count, ar, |r| Ok(r.read_u32::<LE>()?))?)
+                ValueVec::UInt32(read_numeric_array(count, ar, u32::from_le_bytes)?)
             }
             PropertyType::UInt64Property => {
-                ValueVec::UInt64(read_array(count, ar, |r| Ok(r.read_u64::<LE>()?))?)
+                ValueVec::UInt64(read_numeric_array(count, ar, u64::from_le_bytes)?)
             }
-            PropertyType::FloatProperty => {
-                ValueVec::Float(read_array(count, ar, |r| Ok(r.read_f32::<LE>()?.into()))?)
-            }
-            PropertyType::DoubleProperty => {
-                ValueVec::Double(read_array(count, ar, |r| Ok(r.read_f64::<LE>()?.into()))?)
-            }
+            PropertyType::FloatProperty => ValueVec::Float(read_numeric_array(count, ar, |v| {
+                f32::from_le_bytes(v).into()
+            })?),
+            PropertyType::DoubleProperty => ValueVec::Double(read_numeric_array(count, ar, |v| {
+                f64::from_le_bytes(v).into()
+            })?),
             PropertyType::BoolProperty => {
-                ValueVec::Bool(read_array(count, ar, |r| Ok(r.read_u8()? > 0))?)
+                ValueVec::Bool(read_numeric_array(count, ar, |[v]| v > 0)?)
             }
             PropertyType::ByteProperty => {
                 if size == count {
@@ -4380,7 +4400,7 @@ impl<T: ArchiveType> ValueVec<T> {
     )]
     fn read_array<A: ArchiveReader<ArchiveType = T>>(
         ar: &mut A,
-        tag: PropertyTagDataFull,
+        tag: &PropertyTagDataFull,
         size: u32,
     ) -> Result<(ValueVec<T>, Option<PropertyTagDataFull>)> {
         let count = ar.read_u32::<LE>()?;
@@ -4411,7 +4431,7 @@ impl<T: ArchiveType> ValueVec<T> {
                         (StructType::Struct(None), None)
                     }
                 } else {
-                    (struct_type, None)
+                    (struct_type.clone(), None)
                 };
 
                 let mut value = vec![];
@@ -4563,6 +4583,15 @@ impl<T: ArchiveType> Property<T> {
             Err(e) => {
                 // Check if we should convert errors to raw properties
                 if ar.error_to_raw() {
+                    #[cfg(feature = "tracing")]
+                    let _span = tracing::info_span!(
+                        target: "uesave::perf",
+                        "save.raw_fallback",
+                        bytes = tag.size,
+                        path = %ar.path(),
+                        error = %e,
+                    )
+                    .entered();
                     // Parsing failed, seek back to start and read raw data
                     if ar.log() {
                         eprintln!("Warning: Failed to parse property '{}': {}", ar.path(), e);
@@ -4611,7 +4640,7 @@ impl<T: ArchiveType> Property<T> {
                 (Property::Map(value), None)
             }
             PropertyTagDataFull::Array(data) => {
-                let (array, updated_data) = ValueVec::read_array(ar, *data.clone(), tag.size - 4)?;
+                let (array, updated_data) = ValueVec::read_array(ar, data, tag.size - 4)?;
                 (Property::Array(array), updated_data)
             }
             // Bool is special - value stored in tag for top-level properties
@@ -5006,7 +5035,7 @@ pub struct Save {
 }
 impl Save {
     /// Reads save from the given reader
-    #[cfg_attr(feature = "tracing", instrument(name = "Root_read", skip_all))]
+    #[cfg_attr(feature = "tracing", instrument(name = "Save_read", skip_all))]
     pub fn read<R: Read>(reader: &mut R) -> Result<Self, ParseError> {
         Self::read_with_types(reader, Types::new())
     }
@@ -5115,6 +5144,10 @@ impl SaveReader {
     }
     /// Read a save from a seekable stream, such as a `Cursor` over bytes in memory or a
     /// [`CompressedReader`], without buffering it. Skipped properties are seeked over.
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "save.read", target = "uesave::perf", skip_all)
+    )]
     pub fn read_seekable<S: Read + Seek>(self, stream: S) -> Result<Save, ParseError> {
         let types = self.types.unwrap_or_else(|| Rc::new(Types::new()));
         let schemas = Rc::new(RefCell::new(PropertySchemas::new()));
@@ -5132,10 +5165,19 @@ impl SaveReader {
         };
 
         let result = || -> Result<_> {
-            let header = Header::read(&mut reader)?;
+            let header = {
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!(target: "uesave::perf", "save.header").entered();
+                Header::read(&mut reader)?
+            };
             reader.set_version(header.clone());
 
-            let root = Root::read(&mut reader)?;
+            let root = {
+                #[cfg(feature = "tracing")]
+                let _span =
+                    tracing::info_span!(target: "uesave::perf", "save.properties").entered();
+                Root::read(&mut reader)?
+            };
             let extra = {
                 let mut buf = vec![];
                 reader.read_to_end(&mut buf)?;

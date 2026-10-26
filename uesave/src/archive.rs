@@ -221,6 +221,14 @@ where
         {
             return None;
         }
+        #[cfg(feature = "tracing")]
+        let _span = tracing::info_span!(
+            target: "uesave::perf",
+            "save.nested_properties",
+            path = self.scope.as_str(),
+            bytes = bytes.len(),
+        )
+        .entered();
         // Read everything inside, with the same versions and hints, failing rather than
         // falling back to raw values: a list that doesn't parse stays as bytes.
         let mut inner = SaveGameArchive {

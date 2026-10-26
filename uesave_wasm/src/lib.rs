@@ -96,12 +96,12 @@ pub fn sav_property_bytes(data: &[u8], name: &str) -> Result<Vec<u8>, JsValue> {
         .root
         .properties
         .0
-        .iter()
+        .into_iter()
         .find(|(key, _)| key.1 == name)
         .map(|(_, property)| property)
         .ok_or_else(|| JsValue::from_str(&format!("no property named '{name}'")))?;
     match property {
-        Property::Array(ValueVec::Byte(ByteArray::Byte(bytes))) => Ok(bytes.clone()),
+        Property::Array(ValueVec::Byte(ByteArray::Byte(bytes))) => Ok(bytes),
         _ => Err(JsValue::from_str(&format!(
             "property '{name}' is not a byte array"
         ))),
@@ -125,9 +125,16 @@ fn read_to_json<S: Read + Seek>(
     hints_json: &str,
     paths: Option<Vec<String>>,
 ) -> Result<String, JsValue> {
-    serde_json::to_string(&read_save(stream, hints_json, paths)?).map_err(to_js)
+    let save = read_save(stream, hints_json, paths)?;
+    #[cfg(feature = "tracing")]
+    let _span = tracing::info_span!(target: "uesave::perf", "wasm.serialize_json").entered();
+    serde_json::to_string(&save).map_err(to_js)
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wasm.parse", target = "uesave::perf", skip_all)
+)]
 fn read_save<S: Read + Seek>(
     stream: S,
     hints_json: &str,

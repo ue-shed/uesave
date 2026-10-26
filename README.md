@@ -77,6 +77,26 @@ Options:
 ```
 ![edit](https://user-images.githubusercontent.com/1144160/210157064-234da188-ad20-416f-9ea5-7d2956168a20.svg)
 
+## Measuring performance
+
+Run `cargo run -p uesave --release --example profile-read -- path/to/save.sav --json`
+to measure parsing and JSON serialization separately. The file is loaded before timing;
+parsing includes dropping the result. Each measurement reports the median and range of
+seven batches of at least 250 ms. `--compressed` reads a UE compressed archive containing
+a length-prefixed save, `--hints hints.json` accepts the WASM hint format (including
+`"Properties"`), and `--paths '["SaveData.playerInfo"]'` selects properties.
+
+For phase durations, add `--features tracing` before `--` and `--trace` after it. This
+runs once and prints span busy/idle times to stderr, filtered to the `uesave::perf` target.
+Spans cover the complete read, header, properties, compressed chunk indexing and cache-miss
+inflation, nested property decoding, and raw fallback. Nested durations are inclusive;
+they should not be added to their parents. Measure speed without tracing enabled.
+The CLI's existing `test-resave --trace` output records byte provenance rather than timing.
+
+The WASM crate also has a `tracing` feature, forwarding parser spans and adding parse,
+query, JSON serialization, JS serialization, and key enumeration spans. Embedders must
+install a subscriber to collect them; default builds contain no tracing instrumentation.
+
 ## Alternative projects
 in no particular order:
 - https://github.com/rob0rt/drg-save-parser

@@ -9,7 +9,7 @@ use std::io::Cursor;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use uesave::{ByteArray, MapEntry, Properties, Property, Save, StructValue, ValueVec};
+use uesave::{ByteArray, MapEntry, Properties, Property, PropertyKey, Save, StructValue, ValueVec};
 use wasm_bindgen::prelude::*;
 
 use crate::{open_compressed, parse_paths, read_save, to_js};
@@ -53,6 +53,10 @@ impl ParsedSave {
 
     /// The whole save as JSON, the same as `sav_to_json`
     #[wasm_bindgen(js_name = toJson)]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wasm.serialize_json", target = "uesave::perf", skip_all)
+    )]
     pub fn to_json(&self) -> Result<String, JsValue> {
         serde_json::to_string(&self.save).map_err(to_js)
     }
@@ -60,12 +64,14 @@ impl ParsedSave {
     /// The value at `path` as JSON
     pub fn json(&self, path_json: &str) -> Result<String, JsValue> {
         let node = self.find(path_json)?;
+        #[cfg(feature = "tracing")]
+        let _span = tracing::info_span!(target: "uesave::perf", "wasm.serialize_json").entered();
         let json = match node {
             Node::Properties(p) => serde_json::to_string(p),
             Node::Property(p) => serde_json::to_string(p),
             Node::Struct(s) => serde_json::to_string(s),
             Node::Entry(e) => serde_json::to_string(e),
-            Node::Leaf(v) => Ok(v.to_string()),
+            Node::Leaf(v) => serde_json::to_string(&v),
         };
         json.map_err(to_js)
     }
@@ -77,6 +83,8 @@ impl ParsedSave {
     pub fn value(&self, path_json: &str) -> Result<JsValue, JsValue> {
         let serializer = serde_wasm_bindgen::Serializer::json_compatible();
         let node = self.find(path_json)?;
+        #[cfg(feature = "tracing")]
+        let _span = tracing::info_span!(target: "uesave::perf", "wasm.serialize_js").entered();
         let value = match node {
             Node::Properties(p) => p.serialize(&serializer),
             Node::Property(p) => p.serialize(&serializer),
@@ -91,6 +99,10 @@ impl ParsedSave {
     /// `{ key, kind, len }`, where `key` is the next path segment, `kind` names the
     /// value's type, and `len` counts its children (absent for plain values). Plain
     /// values also include `value`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wasm.keys", target = "uesave::perf", skip_all)
+    )]
     pub fn keys(&self, path_json: &str) -> Result<String, JsValue> {
         let children: Vec<Value> = match self.find(path_json)? {
             Node::Properties(props) => props
@@ -118,6 +130,10 @@ impl ParsedSave {
         serde_json::to_string(&children).map_err(to_js)
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wasm.query", target = "uesave::perf", skip_all)
+    )]
     fn find(&self, path_json: &str) -> Result<Node<'_>, JsValue> {
         let path: Vec<Value> = if path_json.trim().is_empty() {
             vec![]
@@ -142,8 +158,8 @@ enum Node<'a> {
     Property(&'a Property),
     Struct(&'a StructValue),
     Entry(&'a MapEntry),
-    /// An element of a plain-value array, serialized on the way down
-    Leaf(Value),
+    /// One borrowed element, serialized only after resolving the path.
+    Leaf(ArrayItem<'a>),
 }
 
 impl<'a> Node<'a> {
@@ -151,11 +167,13 @@ impl<'a> Node<'a> {
         match self {
             Node::Properties(props) => {
                 let name = segment.as_str()?;
-                props
-                    .0
-                    .iter()
-                    .find(|(key, _)| format!("{}_{}", key.1, key.0) == name)
-                    .map(|(_, value)| Node::Property(value))
+                let (name, index) = name.rsplit_once('_')?;
+                // Only accept the canonical decimal suffix the serializer produces.
+                if index.starts_with('+') || (index.len() > 1 && index.starts_with('0')) {
+                    return None;
+                }
+                let key = PropertyKey(index.parse().ok()?, name.to_owned());
+                props.0.get(&key).map(Node::Property)
             }
             Node::Property(Property::Struct(s)) => Node::Struct(s).child(segment),
             Node::Property(Property::Array(ValueVec::Properties(props))) => {
@@ -181,12 +199,45 @@ impl<'a> Node<'a> {
 fn vec_item(values: &ValueVec, index: usize) -> Option<Node<'_>> {
     match values {
         ValueVec::Struct(items) => items.get(index).map(Node::Struct),
-        other => to_json_value(other)
-            .ok()?
-            .as_array()?
-            .get(index)
-            .cloned()
-            .map(Node::Leaf),
+        // These serialize as objects rather than plain arrays.
+        ValueVec::Byte(_) | ValueVec::Properties(_) => None,
+        _ if index < vec_len(values) => Some(Node::Leaf(ArrayItem { values, index })),
+        _ => None,
+    }
+}
+
+struct ArrayItem<'a> {
+    values: &'a ValueVec,
+    index: usize,
+}
+
+impl Serialize for ArrayItem<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let i = self.index;
+        match self.values {
+            ValueVec::Int8(v) => v[i].serialize(serializer),
+            ValueVec::Int16(v) => v[i].serialize(serializer),
+            ValueVec::Int(v) => v[i].serialize(serializer),
+            ValueVec::Int64(v) => v[i].serialize(serializer),
+            ValueVec::UInt8(v) => v[i].serialize(serializer),
+            ValueVec::UInt16(v) => v[i].serialize(serializer),
+            ValueVec::UInt32(v) => v[i].serialize(serializer),
+            ValueVec::UInt64(v) => v[i].serialize(serializer),
+            ValueVec::Float(v) => v[i].serialize(serializer),
+            ValueVec::Double(v) => v[i].serialize(serializer),
+            ValueVec::Bool(v) => v[i].serialize(serializer),
+            ValueVec::Enum(v) | ValueVec::Str(v) | ValueVec::Name(v) | ValueVec::Object(v) => {
+                v[i].serialize(serializer)
+            }
+            ValueVec::Text(v) => v[i].serialize(serializer),
+            ValueVec::SoftObject(v) => v[i].serialize(serializer),
+            ValueVec::Box(v) => v[i].serialize(serializer),
+            ValueVec::Box2D(v) => v[i].serialize(serializer),
+            ValueVec::Struct(v) => v[i].serialize(serializer),
+            ValueVec::Byte(_) | ValueVec::Properties(_) => {
+                Err(serde::ser::Error::custom("expected a plain-value array"))
+            }
+        }
     }
 }
 
@@ -290,5 +341,84 @@ fn optional_paths(paths_json: &str) -> Result<Option<Vec<String>>, JsValue> {
         Ok(None)
     } else {
         parse_paths(paths_json).map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_queries_serialize_only_the_selected_item() {
+        let arrays: Vec<ValueVec> = vec![
+            ValueVec::Int8(vec![i8::MIN, i8::MAX]),
+            ValueVec::Int16(vec![i16::MIN, i16::MAX]),
+            ValueVec::Int(vec![i32::MIN, i32::MAX]),
+            ValueVec::Int64(vec![i64::MIN, i64::MAX]),
+            ValueVec::UInt8(vec![0, u8::MAX]),
+            ValueVec::UInt16(vec![0, u16::MAX]),
+            ValueVec::UInt32(vec![0, u32::MAX]),
+            ValueVec::UInt64(vec![0, u64::MAX]),
+            ValueVec::Float(vec![28812.8671875f32.into(), f32::INFINITY.into()]),
+            ValueVec::Double(vec![(-0.0).into(), f64::NEG_INFINITY.into()]),
+            ValueVec::Bool(vec![false, true]),
+            ValueVec::Enum(vec!["First".into(), "Last".into()]),
+            ValueVec::Str(vec!["first".into(), "last".into()]),
+            ValueVec::Name(vec!["first".into(), "last".into()]),
+            ValueVec::Object(vec!["first".into(), "last".into()]),
+            ValueVec::Box(vec![
+                serde_json::from_value(json!({
+                    "min": { "x": -1, "y": -2, "z": -3 },
+                    "max": { "x": 1, "y": 2, "z": 3 }, "is_valid": true
+                }))
+                .unwrap();
+                2
+            ]),
+            ValueVec::Box2D(vec![
+                serde_json::from_value(json!({
+                    "min": { "x": -1, "y": -2 },
+                    "max": { "x": 1, "y": 2 }, "is_valid": true
+                }))
+                .unwrap();
+                2
+            ]),
+        ];
+        for array in arrays {
+            let full = to_json_value(&array).unwrap();
+            for index in 0..2 {
+                let Some(Node::Leaf(item)) = vec_item(&array, index) else {
+                    panic!("missing item {index} in {array:?}");
+                };
+                assert_eq!(to_json_value(&item).unwrap(), full[index], "{array:?}");
+            }
+            assert!(vec_item(&array, 2).is_none());
+            assert!(vec_item(&array, usize::MAX).is_none());
+        }
+    }
+
+    #[test]
+    fn property_queries_handle_underscores_and_array_indices() {
+        let mut props = Properties::default();
+        props.insert(
+            PropertyKey(42, "with_underscores_0".into()),
+            Property::Int(99),
+        );
+        props.insert("Numbers", Property::Array(ValueVec::Int(vec![10, 20, 30])));
+        let node = Node::Properties(&props).child(&json!("with_underscores_0_42"));
+        assert!(matches!(node, Some(Node::Property(Property::Int(99)))));
+        for name in [
+            "with_underscores_0_042",
+            "with_underscores_0_+42",
+            "Numbers_00",
+            "Numbers_1",
+            "Numbers",
+        ] {
+            assert!(Node::Properties(&props).child(&json!(name)).is_none());
+        }
+        let node = Node::Properties(&props).child(&json!("Numbers_0")).unwrap();
+        let Some(Node::Leaf(item)) = node.child(&json!(1)) else {
+            panic!("missing item")
+        };
+        assert_eq!(serde_json::to_string(&item).unwrap(), "20");
     }
 }

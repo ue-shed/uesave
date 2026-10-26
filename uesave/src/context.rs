@@ -172,6 +172,9 @@ impl<R: Read> Read for SaveGameArchive<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.stream.read(buf)
     }
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.stream.read_exact(buf)
+    }
 }
 impl<S: Seek> Seek for SaveGameArchive<S> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {

@@ -710,6 +710,136 @@ fn test_compressed_reader_rejects_bad_data() {
     assert!(reader.window(len - 1, 2).is_err());
 }
 
+#[test]
+fn test_compressed_reader_seeks_within_and_between_chunks() {
+    use std::io::SeekFrom;
+    let bytes: Vec<u8> = (0..257).map(|i| (i * 13) as u8).collect();
+    let compressed = ue_compress(&bytes, 31);
+    let mut reader = open_ue_compressed(&compressed);
+    for offset in [0, 1, 4, 30, 29, 80, 7, 230, 140, 0] {
+        reader.seek(SeekFrom::Start(offset)).unwrap();
+        let mut out = [0; 17];
+        reader.read_exact(&mut out).unwrap();
+        assert_eq!(out, bytes[offset as usize..offset as usize + 17]);
+    }
+    reader.seek(SeekFrom::End(0)).unwrap();
+    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn test_numeric_arrays_across_read_and_compression_boundaries() -> Result<()> {
+    for count in [0, 1, 1023, 1024, 1025, 4097] {
+        let values: Vec<ValueVec> = vec![
+            ValueVec::Int8((0..count).map(|i| (i as i8).wrapping_sub(70)).collect()),
+            ValueVec::Int16((0..count).map(|i| i as i16 - 2000).collect()),
+            ValueVec::Int((0..count).map(|i| i as i32 * -123456).collect()),
+            ValueVec::Int64((0..count).map(|i| i as i64 * -12345678901).collect()),
+            ValueVec::UInt8((0..count).map(|i| i as u8).collect()),
+            ValueVec::UInt16((0..count).map(|i| i as u16 * 13).collect()),
+            ValueVec::UInt32((0..count).map(|i| i as u32 * 123456).collect()),
+            ValueVec::UInt64((0..count).map(|i| i as u64 * 12345678901).collect()),
+            ValueVec::Float((0..count).map(|i| (i as f32 * -0.125).into()).collect()),
+            ValueVec::Double((0..count).map(|i| (i as f64 * -0.125).into()).collect()),
+            ValueVec::Bool((0..count).map(|i| i % 3 == 0).collect()),
+        ];
+        let types = [
+            PropertyType::Int8Property,
+            PropertyType::Int16Property,
+            PropertyType::IntProperty,
+            PropertyType::Int64Property,
+            PropertyType::UInt8Property,
+            PropertyType::UInt16Property,
+            PropertyType::UInt32Property,
+            PropertyType::UInt64Property,
+            PropertyType::FloatProperty,
+            PropertyType::DoubleProperty,
+            PropertyType::BoolProperty,
+        ];
+        for (value, ty) in values.into_iter().zip(types) {
+            let mut encoded = Cursor::new(vec![]);
+            run(&mut encoded, |ar| value.write(ar))?;
+            let encoded = encoded.into_inner();
+            let compressed = ue_compress(&encoded, 1019);
+            let decode = |ar: &mut SaveGameArchive<_>| {
+                assert_eq!(ar.read_u32::<LE>()?, count as u32);
+                ValueVec::read(ar, &ty, (encoded.len() - 4) as u32, count as u32)
+            };
+            let decoded = run(open_ue_compressed(&compressed), decode)?;
+            assert_eq!(decoded, value, "{ty:?}, count {count}");
+            let mut roundtrip = Cursor::new(vec![]);
+            run(&mut roundtrip, |ar| decoded.write(ar))?;
+            assert_eq!(roundtrip.into_inner(), encoded);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_numeric_arrays_reject_truncated_and_untrusted_lengths() {
+    for ty in [
+        PropertyType::IntProperty,
+        PropertyType::UInt64Property,
+        PropertyType::DoubleProperty,
+    ] {
+        assert!(run(Cursor::new([0u8; 7]), |ar| ValueVec::read(
+            ar,
+            &ty,
+            7,
+            u32::MAX
+        ))
+        .is_err());
+        assert!(run(Cursor::new([0u8; 7]), |ar| ValueVec::read(ar, &ty, 8, 2)).is_err());
+    }
+}
+
+#[test]
+fn test_numeric_arrays_preserve_float_bits_and_nonzero_bools() -> Result<()> {
+    let bits = [0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc01234, 1];
+    let bytes: Vec<u8> = bits.into_iter().flat_map(u32::to_le_bytes).collect();
+    let value: ValueVec = run(Cursor::new(&bytes), |ar| {
+        ValueVec::read(
+            ar,
+            &PropertyType::FloatProperty,
+            bytes.len() as u32,
+            bits.len() as u32,
+        )
+    })?;
+    let mut encoded = Cursor::new(vec![]);
+    run(&mut encoded, |ar| value.write(ar))?;
+    assert_eq!(&encoded.into_inner()[4..], bytes);
+    let value: ValueVec = run(Cursor::new([0, 1, 2, 128, 255]), |ar| {
+        ValueVec::read(ar, &PropertyType::BoolProperty, 5, 5)
+    })?;
+    assert_eq!(value, ValueVec::Bool(vec![false, true, true, true, true]));
+    Ok(())
+}
+
+#[test]
+fn test_truncated_numeric_array_falls_back_without_losing_next_property() -> Result<()> {
+    let mut bytes = vec![];
+    push_string(&mut bytes, "Numbers");
+    push_string(&mut bytes, "ArrayProperty");
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    push_string(&mut bytes, "IntProperty");
+    bytes.push(0);
+    let mut raw = u32::MAX.to_le_bytes().to_vec();
+    raw.extend_from_slice(&123i32.to_le_bytes());
+    bytes.extend_from_slice(&raw);
+    push_string(&mut bytes, "After");
+    push_string(&mut bytes, "IntProperty");
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&42i32.to_le_bytes());
+    push_string(&mut bytes, "None");
+    let props = run(Cursor::new(bytes), |ar| {
+        ar.error_to_raw = true;
+        read_properties_until_none(ar)
+    })?;
+    assert_eq!(props["Numbers"], Property::Raw(raw));
+    assert_eq!(props["After"], Property::Int(42));
+    Ok(())
+}
+
 /// The property list inside `test_read_struct_property`'s struct: Level 140, XP 9018,
 /// HasAwardedForOldPurchases true, then None.
 fn vanity_mastery_properties() -> Vec<u8> {

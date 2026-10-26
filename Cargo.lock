@@ -613,6 +613,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -636,6 +637,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "tracing",
  "uesave",
  "wasm-bindgen",
 ]
