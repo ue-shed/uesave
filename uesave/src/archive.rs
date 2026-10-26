@@ -83,6 +83,15 @@ pub trait ArchiveReader: Read + Seek {
     fn skip_property(&self) -> bool {
         false
     }
+
+    /// Decode `bytes`, the byte array at the current scope, as a property list when it
+    /// was asked for. `None` when it wasn't, or when the bytes don't parse as one.
+    fn read_nested_properties(
+        &mut self,
+        _bytes: &[u8],
+    ) -> Option<crate::Properties<Self::ArchiveType>> {
+        None
+    }
 }
 
 pub trait ArchiveWriter: Write + Seek {
@@ -201,6 +210,76 @@ where
             .as_ref()
             .is_some_and(|filter| !filter.includes(self.scope.as_str()))
     }
+
+    fn read_nested_properties(&mut self, bytes: &[u8]) -> Option<crate::Properties> {
+        // An empty array holds nothing, not even the `None` a property list ends with.
+        if bytes.is_empty()
+            || !self
+                .nested
+                .as_ref()
+                .is_some_and(|nested| nested.includes(self.scope.as_str()))
+        {
+            return None;
+        }
+        #[cfg(feature = "tracing")]
+        let _span = tracing::info_span!(
+            target: "uesave::perf",
+            "save.nested_properties",
+            path = self.scope.as_str(),
+            bytes = bytes.len(),
+        )
+        .entered();
+        // Read everything inside, with the same versions and hints, failing rather than
+        // falling back to raw values: a list that doesn't parse stays as bytes.
+        let mut inner = SaveGameArchive {
+            stream: std::io::Cursor::new(bytes),
+            version: self.version.clone(),
+            types: self.types.clone(),
+            scope: self.scope.clone(),
+            log: self.log,
+            error_to_raw: false,
+            schemas: self.schemas.clone(),
+            filter: None,
+            nested: self.nested.clone(),
+        };
+        match read_property_list(&mut inner) {
+            Ok(properties) => Some(properties),
+            Err(e) => {
+                if self.log {
+                    eprintln!("\"{}\": {e}, keeping bytes", self.scope.as_str());
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Read a property list that fills `ar`'s bytes: tagged properties up to `None`, then the
+/// 32-bit "has object GUID" flag `UObject::Serialize` writes after them and, when set, the
+/// GUID (read past, not kept). Fails unless every byte is read.
+pub(crate) fn read_property_list(
+    ar: &mut SaveGameArchive<std::io::Cursor<&[u8]>>,
+) -> Result<crate::Properties> {
+    let bytes = *ar.stream.get_ref();
+    let properties = crate::read_properties_until_none(ar).map_err(|e| {
+        crate::Error::Other(format!(
+            "not a property list at byte {} ({e})",
+            ar.stream.position()
+        ))
+    })?;
+    let mut read = ar.stream.position() as usize;
+    match &bytes[read.min(bytes.len())..] {
+        [0, 0, 0, 0] => read += 4,
+        [1, 0, 0, 0, guid @ ..] if guid.len() == 16 => read += 20,
+        _ => {}
+    }
+    if read != bytes.len() {
+        return Err(crate::Error::Other(format!(
+            "property list ends after {read} of {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(properties)
 }
 impl<W> ArchiveWriter for SaveGameArchive<W>
 where

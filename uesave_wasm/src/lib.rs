@@ -9,6 +9,9 @@ use wasm_bindgen::prelude::*;
 mod tree;
 pub use tree::ParsedSave;
 
+/// The hint value that decodes a byte array as a property list (see `sav_to_json`).
+const NESTED_PROPERTIES: &str = "Properties";
+
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
@@ -26,6 +29,12 @@ pub fn init() {
 ///   - Known variant name ("DateTime", "Vector", "GameplayTagContainer", ...) → that variant
 ///   - "Struct"                                                               → Struct(None)
 ///   - anything else                                                          → Struct(Some(name))
+///
+/// One more value isn't a struct type: `"Properties"` on a byte array property (a
+/// `TArray<uint8>`) decodes its bytes as a property list, for games that store a struct's
+/// tagged properties in one. It then reads as an object of properties instead of
+/// `{"Byte": [...]}`, and the save can't be written back with `json_to_sav`. Bytes that
+/// don't parse as a property list are kept as they are.
 #[wasm_bindgen]
 pub fn sav_to_json(data: &[u8], hints_json: &str) -> Result<String, JsValue> {
     read_to_json(Cursor::new(data), hints_json, None)
@@ -87,12 +96,12 @@ pub fn sav_property_bytes(data: &[u8], name: &str) -> Result<Vec<u8>, JsValue> {
         .root
         .properties
         .0
-        .iter()
+        .into_iter()
         .find(|(key, _)| key.1 == name)
         .map(|(_, property)| property)
         .ok_or_else(|| JsValue::from_str(&format!("no property named '{name}'")))?;
     match property {
-        Property::Array(ValueVec::Byte(ByteArray::Byte(bytes))) => Ok(bytes.clone()),
+        Property::Array(ValueVec::Byte(ByteArray::Byte(bytes))) => Ok(bytes),
         _ => Err(JsValue::from_str(&format!(
             "property '{name}' is not a byte array"
         ))),
@@ -116,28 +125,49 @@ fn read_to_json<S: Read + Seek>(
     hints_json: &str,
     paths: Option<Vec<String>>,
 ) -> Result<String, JsValue> {
-    serde_json::to_string(&read_save(stream, hints_json, paths)?).map_err(to_js)
+    let save = read_save(stream, hints_json, paths)?;
+    #[cfg(feature = "tracing")]
+    let _span = tracing::info_span!(target: "uesave::perf", "wasm.serialize_json").entered();
+    serde_json::to_string(&save).map_err(to_js)
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wasm.parse", target = "uesave::perf", skip_all)
+)]
 fn read_save<S: Read + Seek>(
     stream: S,
     hints_json: &str,
     paths: Option<Vec<String>>,
 ) -> Result<Save, JsValue> {
-    let mut types = Types::new();
-    if !hints_json.trim().is_empty() {
-        let hints: HashMap<String, String> = serde_json::from_str(hints_json)
-            .map_err(|e| JsValue::from_str(&format!("invalid hints: {e}")))?;
-        for (path, t) in hints {
-            types.add(path, StructType::from(t.as_str()));
-        }
-    }
-
-    let mut reader = SaveReader::new().error_to_raw(true).types(types);
+    let mut reader = reader(hints_json)?.error_to_raw(true);
     if let Some(paths) = paths {
         reader = reader.only(paths);
     }
     reader.read_seekable(stream).map_err(to_js)
+}
+
+/// A reader with the type hints and nested paths in `hints_json`.
+fn reader(hints_json: &str) -> Result<SaveReader, JsValue> {
+    let mut types = Types::new();
+    let mut nested = vec![];
+    if !hints_json.trim().is_empty() {
+        let hints: HashMap<String, String> = serde_json::from_str(hints_json)
+            .map_err(|e| JsValue::from_str(&format!("invalid hints: {e}")))?;
+        for (path, t) in hints {
+            if t == NESTED_PROPERTIES {
+                nested.push(path);
+            } else {
+                types.add(path, StructType::from(t.as_str()));
+            }
+        }
+    }
+
+    let mut reader = SaveReader::new().types(types);
+    if !nested.is_empty() {
+        reader = reader.nested(nested);
+    }
+    Ok(reader)
 }
 
 fn to_js(e: impl std::fmt::Display) -> JsValue {

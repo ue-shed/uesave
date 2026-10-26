@@ -709,3 +709,375 @@ fn test_compressed_reader_rejects_bad_data() {
     let len = reader.len();
     assert!(reader.window(len - 1, 2).is_err());
 }
+
+#[test]
+fn test_compressed_reader_seeks_within_and_between_chunks() {
+    use std::io::SeekFrom;
+    let bytes: Vec<u8> = (0..257).map(|i| (i * 13) as u8).collect();
+    let compressed = ue_compress(&bytes, 31);
+    let mut reader = open_ue_compressed(&compressed);
+    for offset in [0, 1, 4, 30, 29, 80, 7, 230, 140, 0] {
+        reader.seek(SeekFrom::Start(offset)).unwrap();
+        let mut out = [0; 17];
+        reader.read_exact(&mut out).unwrap();
+        assert_eq!(out, bytes[offset as usize..offset as usize + 17]);
+    }
+    reader.seek(SeekFrom::End(0)).unwrap();
+    assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn test_numeric_arrays_across_read_and_compression_boundaries() -> Result<()> {
+    for count in [0, 1, 1023, 1024, 1025, 4097] {
+        let values: Vec<ValueVec> = vec![
+            ValueVec::Int8((0..count).map(|i| (i as i8).wrapping_sub(70)).collect()),
+            ValueVec::Int16((0..count).map(|i| i as i16 - 2000).collect()),
+            ValueVec::Int((0..count).map(|i| i as i32 * -123456).collect()),
+            ValueVec::Int64((0..count).map(|i| i as i64 * -12345678901).collect()),
+            ValueVec::UInt8((0..count).map(|i| i as u8).collect()),
+            ValueVec::UInt16((0..count).map(|i| i as u16 * 13).collect()),
+            ValueVec::UInt32((0..count).map(|i| i as u32 * 123456).collect()),
+            ValueVec::UInt64((0..count).map(|i| i as u64 * 12345678901).collect()),
+            ValueVec::Float((0..count).map(|i| (i as f32 * -0.125).into()).collect()),
+            ValueVec::Double((0..count).map(|i| (i as f64 * -0.125).into()).collect()),
+            ValueVec::Bool((0..count).map(|i| i % 3 == 0).collect()),
+        ];
+        let types = [
+            PropertyType::Int8Property,
+            PropertyType::Int16Property,
+            PropertyType::IntProperty,
+            PropertyType::Int64Property,
+            PropertyType::UInt8Property,
+            PropertyType::UInt16Property,
+            PropertyType::UInt32Property,
+            PropertyType::UInt64Property,
+            PropertyType::FloatProperty,
+            PropertyType::DoubleProperty,
+            PropertyType::BoolProperty,
+        ];
+        for (value, ty) in values.into_iter().zip(types) {
+            let mut encoded = Cursor::new(vec![]);
+            run(&mut encoded, |ar| value.write(ar))?;
+            let encoded = encoded.into_inner();
+            let compressed = ue_compress(&encoded, 1019);
+            let decode = |ar: &mut SaveGameArchive<_>| {
+                assert_eq!(ar.read_u32::<LE>()?, count as u32);
+                ValueVec::read(ar, &ty, (encoded.len() - 4) as u32, count as u32)
+            };
+            let decoded = run(open_ue_compressed(&compressed), decode)?;
+            assert_eq!(decoded, value, "{ty:?}, count {count}");
+            let mut roundtrip = Cursor::new(vec![]);
+            run(&mut roundtrip, |ar| decoded.write(ar))?;
+            assert_eq!(roundtrip.into_inner(), encoded);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_numeric_arrays_reject_truncated_and_untrusted_lengths() {
+    for ty in [
+        PropertyType::IntProperty,
+        PropertyType::UInt64Property,
+        PropertyType::DoubleProperty,
+    ] {
+        assert!(run(Cursor::new([0u8; 7]), |ar| ValueVec::read(
+            ar,
+            &ty,
+            7,
+            u32::MAX
+        ))
+        .is_err());
+        assert!(run(Cursor::new([0u8; 7]), |ar| ValueVec::read(ar, &ty, 8, 2)).is_err());
+    }
+}
+
+#[test]
+fn test_numeric_arrays_preserve_float_bits_and_nonzero_bools() -> Result<()> {
+    let bits = [0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc01234, 1];
+    let bytes: Vec<u8> = bits.into_iter().flat_map(u32::to_le_bytes).collect();
+    let value: ValueVec = run(Cursor::new(&bytes), |ar| {
+        ValueVec::read(
+            ar,
+            &PropertyType::FloatProperty,
+            bytes.len() as u32,
+            bits.len() as u32,
+        )
+    })?;
+    let mut encoded = Cursor::new(vec![]);
+    run(&mut encoded, |ar| value.write(ar))?;
+    assert_eq!(&encoded.into_inner()[4..], bytes);
+    let value: ValueVec = run(Cursor::new([0, 1, 2, 128, 255]), |ar| {
+        ValueVec::read(ar, &PropertyType::BoolProperty, 5, 5)
+    })?;
+    assert_eq!(value, ValueVec::Bool(vec![false, true, true, true, true]));
+    Ok(())
+}
+
+#[test]
+fn test_truncated_numeric_array_falls_back_without_losing_next_property() -> Result<()> {
+    let mut bytes = vec![];
+    push_string(&mut bytes, "Numbers");
+    push_string(&mut bytes, "ArrayProperty");
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    push_string(&mut bytes, "IntProperty");
+    bytes.push(0);
+    let mut raw = u32::MAX.to_le_bytes().to_vec();
+    raw.extend_from_slice(&123i32.to_le_bytes());
+    bytes.extend_from_slice(&raw);
+    push_string(&mut bytes, "After");
+    push_string(&mut bytes, "IntProperty");
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&42i32.to_le_bytes());
+    push_string(&mut bytes, "None");
+    let props = run(Cursor::new(bytes), |ar| {
+        ar.error_to_raw = true;
+        read_properties_until_none(ar)
+    })?;
+    assert_eq!(props["Numbers"], Property::Raw(raw));
+    assert_eq!(props["After"], Property::Int(42));
+    Ok(())
+}
+
+/// The property list inside `test_read_struct_property`'s struct: Level 140, XP 9018,
+/// HasAwardedForOldPurchases true, then None.
+fn vanity_mastery_properties() -> Vec<u8> {
+    let mut list = vec![];
+    for (name, ty, value) in [
+        ("Level", "IntProperty", 140i32),
+        ("XP", "IntProperty", 9018),
+    ] {
+        push_string(&mut list, name);
+        push_string(&mut list, ty);
+        list.extend_from_slice(&4u64.to_le_bytes());
+        list.push(0);
+        list.extend_from_slice(&value.to_le_bytes());
+    }
+    push_string(&mut list, "HasAwardedForOldPurchases");
+    push_string(&mut list, "BoolProperty");
+    list.extend_from_slice(&0u64.to_le_bytes());
+    list.extend_from_slice(&[1, 0]);
+    push_string(&mut list, "None");
+    list
+}
+
+fn push_string(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32 + 1).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+    out.push(0);
+}
+
+/// A `TArray<uint8>` property named `Data` holding `bytes`.
+fn byte_array_property(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    push_string(&mut out, "Data");
+    push_string(&mut out, "ArrayProperty");
+    out.extend_from_slice(&(4 + bytes.len() as u64).to_le_bytes());
+    push_string(&mut out, "ByteProperty");
+    out.push(0);
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+fn read_data(property: &[u8], nested: &[&str]) -> Result<Property> {
+    let nested = NestedProperties::new(nested.iter().copied());
+    run(&mut Cursor::new(property), |reader| {
+        reader.nested = Some(std::rc::Rc::new(nested));
+        Ok(read_property(reader)?.unwrap().1)
+    })
+}
+
+#[test]
+fn test_nested_properties_decode_byte_array() -> Result<()> {
+    let property = byte_array_property(&vanity_mastery_properties());
+    assert_eq!(
+        read_data(&property, &["Data"])?,
+        Property::Array(ValueVec::Properties(Properties(indexmap::IndexMap::from(
+            [
+                ("Level".into(), Property::Int(140)),
+                ("XP".into(), Property::Int(9018)),
+                ("HasAwardedForOldPurchases".into(), Property::Bool(true)),
+            ]
+        ))))
+    );
+    Ok(())
+}
+
+#[test]
+fn test_nested_properties_only_at_requested_paths() -> Result<()> {
+    let list = vanity_mastery_properties();
+    let property = byte_array_property(&list);
+    for nested in [&[][..], &["Other"], &["Data.Level"]] {
+        assert_eq!(
+            read_data(&property, nested)?,
+            Property::Array(ValueVec::Byte(ByteArray::Byte(list.clone())))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_nested_properties_keep_bytes_that_do_not_parse() -> Result<()> {
+    let list = vanity_mastery_properties();
+    // Not a property list; a list followed by extra bytes; a list cut short.
+    let mut trailing = list.clone();
+    trailing.extend_from_slice(&[1, 2, 3]);
+    for bytes in [vec![1, 2, 3], trailing, list[..list.len() - 3].to_vec()] {
+        assert_eq!(
+            read_data(&byte_array_property(&bytes), &["Data"])?,
+            Property::Array(ValueVec::Byte(ByteArray::Byte(bytes)))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_nested_properties_are_not_written_back() -> Result<()> {
+    let original = byte_array_property(&vanity_mastery_properties());
+    let nested = NestedProperties::new(["Data"]);
+    let (property, schemas) = run(&mut Cursor::new(&original), |reader| {
+        reader.nested = Some(std::rc::Rc::new(nested));
+        let property = read_property(reader)?.unwrap();
+        Ok((property, reader.schemas.borrow().clone()))
+    })?;
+    let mut out: Vec<u8> = vec![];
+    let result = run(&mut Cursor::new(&mut out), |writer| {
+        *writer.schemas.borrow_mut() = schemas;
+        write_property((&property.0, &property.1), writer)
+    });
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn test_nested_properties_in_a_whole_save() {
+    let plain = SaveReader::new().read(Cursor::new(SAVE)).unwrap();
+    let nested = SaveReader::new()
+        .nested(["Nothing.Here"])
+        .read(Cursor::new(SAVE))
+        .unwrap();
+    assert_eq!(plain, nested);
+}
+
+#[test]
+fn test_nested_properties_read_past_the_object_guid_flag() -> Result<()> {
+    let decoded = read_data(
+        &byte_array_property(&vanity_mastery_properties()),
+        &["Data"],
+    )?;
+    // As `UObject::Serialize` writes them: no GUID, then a GUID.
+    let mut without_guid = vanity_mastery_properties();
+    without_guid.extend_from_slice(&0u32.to_le_bytes());
+    let mut with_guid = vanity_mastery_properties();
+    with_guid.extend_from_slice(&1u32.to_le_bytes());
+    with_guid.extend_from_slice(&[7; 16]);
+    for bytes in [without_guid, with_guid] {
+        assert_eq!(read_data(&byte_array_property(&bytes), &["Data"])?, decoded);
+    }
+    // A set flag without its GUID isn't an object.
+    let mut cut = vanity_mastery_properties();
+    cut.extend_from_slice(&1u32.to_le_bytes());
+    assert_eq!(
+        read_data(&byte_array_property(&cut), &["Data"])?,
+        Property::Array(ValueVec::Byte(ByteArray::Byte(cut)))
+    );
+    Ok(())
+}
+
+/// A map of one entry whose struct keys are 8 bytes (an `FDateTime`, say), followed by an
+/// int property. Without a hint for the key, the reader guesses a 16-byte `Guid`.
+fn map_with_struct_keys_then_int() -> Vec<u8> {
+    let mut out = vec![];
+    push_string(&mut out, "Track");
+    push_string(&mut out, "MapProperty");
+    out.extend_from_slice(&20u32.to_le_bytes()); // size
+    out.extend_from_slice(&0u32.to_le_bytes()); // index
+    push_string(&mut out, "StructProperty");
+    push_string(&mut out, "IntProperty");
+    out.push(0); // no property GUID
+    out.extend_from_slice(&0u32.to_le_bytes()); // keys to remove
+    out.extend_from_slice(&1u32.to_le_bytes()); // entries
+    out.extend_from_slice(&638_433_186_405_150_000i64.to_le_bytes());
+    out.extend_from_slice(&7i32.to_le_bytes());
+    push_string(&mut out, "After");
+    push_string(&mut out, "IntProperty");
+    out.extend_from_slice(&4u64.to_le_bytes());
+    out.push(0);
+    out.extend_from_slice(&42i32.to_le_bytes());
+    push_string(&mut out, "None");
+    out
+}
+
+#[test]
+fn test_property_that_misreads_its_size_falls_back_alone() -> Result<()> {
+    let bytes = map_with_struct_keys_then_int();
+    let properties = run(&mut Cursor::new(&bytes), |reader| {
+        reader.error_to_raw = true;
+        read_properties_until_none(reader)
+    })?;
+    let values: Vec<_> = properties.0.into_values().collect();
+    // The guessed key reads 28 bytes of a 20-byte map: only the map is kept as bytes.
+    assert!(matches!(&values[0], Property::Raw(raw) if raw.len() == 20));
+    assert_eq!(values[1], Property::Int(42));
+    // Without raw fallback, the map fails right where it is.
+    let strict = run(&mut Cursor::new(&bytes), |reader| {
+        read_properties_until_none(reader)
+    });
+    assert!(strict.is_err_and(|e| e
+        .to_string()
+        .contains("read 28 bytes of a 20-byte property")));
+    Ok(())
+}
+
+#[test]
+fn test_read_properties_from_bytes() -> Result<()> {
+    // The same list `nested` decodes in place, read directly.
+    let Property::Array(ValueVec::Properties(expected)) = read_data(
+        &byte_array_property(&vanity_mastery_properties()),
+        &["Data"],
+    )?
+    else {
+        panic!("the byte array wasn't decoded");
+    };
+    let mut with_guid_flag = vanity_mastery_properties();
+    with_guid_flag.extend_from_slice(&0u32.to_le_bytes());
+    for bytes in [vanity_mastery_properties(), with_guid_flag] {
+        let read = SaveReader::new()
+            .read_properties(&bytes, &mock_header(), "Some.Blob")
+            .unwrap();
+        assert_eq!(read, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_read_properties_fails_on_bytes_that_are_not_a_list() {
+    let mut trailing = vanity_mastery_properties();
+    trailing.push(9);
+    let truncated = vanity_mastery_properties()[..20].to_vec();
+    for bytes in [trailing, truncated, b"junk".to_vec(), vec![]] {
+        let result = SaveReader::new().read_properties(&bytes, &mock_header(), "");
+        assert!(result.is_err(), "{bytes:?} read as {result:?}");
+    }
+}
+
+#[test]
+fn test_read_properties_applies_nested_paths_below_its_path() {
+    // A list holding a byte array `Data` that holds a list in turn.
+    let mut outer = byte_array_property(&vanity_mastery_properties());
+    push_string(&mut outer, "None");
+    let read = |nested: &str| {
+        let properties = SaveReader::new()
+            .nested([nested])
+            .read_properties(&outer, &mock_header(), "Wrapper.Blob")
+            .unwrap();
+        properties.0.into_values().next().unwrap()
+    };
+    assert!(matches!(
+        read("Wrapper.Blob.Data"),
+        Property::Array(ValueVec::Properties(_))
+    ));
+    assert!(matches!(read("Data"), Property::Array(ValueVec::Byte(_))));
+}

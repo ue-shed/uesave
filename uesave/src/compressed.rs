@@ -41,6 +41,10 @@ pub struct CompressedReader<'a> {
 
 impl<'a> CompressedReader<'a> {
     /// Index the chunks of `data`. Nothing is inflated yet.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "compressed.index", target = "uesave::perf", skip_all, fields(bytes = data.len()))
+    )]
     pub fn new(data: &'a [u8]) -> io::Result<Self> {
         let mut chunks = vec![];
         let mut offset = 0;
@@ -130,6 +134,15 @@ impl<'a> CompressedReader<'a> {
     fn chunk(&mut self, index: usize) -> io::Result<&[u8]> {
         if self.inflated.as_ref().is_none_or(|(i, _)| *i != index) {
             let chunk = &self.chunks[index];
+            #[cfg(feature = "tracing")]
+            let _span = tracing::info_span!(
+                target: "uesave::perf",
+                "compressed.inflate_chunk",
+                index,
+                compressed_bytes = chunk.data.len(),
+                uncompressed_bytes = chunk.len,
+            )
+            .entered();
             let bytes = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
                 &self.data[chunk.data.clone()],
                 chunk.len as usize,
@@ -154,9 +167,17 @@ impl Read for CompressedReader<'_> {
         if buf.is_empty() || absolute >= self.end {
             return Ok(0);
         }
-        let index = self
-            .chunks
-            .partition_point(|chunk| chunk.start + chunk.len <= absolute);
+        let index = match self.inflated.as_ref().map(|(index, _)| *index) {
+            Some(index)
+                if absolute >= self.chunks[index].start
+                    && absolute < self.chunks[index].start + self.chunks[index].len =>
+            {
+                index
+            }
+            _ => self
+                .chunks
+                .partition_point(|chunk| chunk.start + chunk.len <= absolute),
+        };
         let chunk_start = self.chunks[index].start;
         let end = self.end;
         let bytes = self.chunk(index)?;

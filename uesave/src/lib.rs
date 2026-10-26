@@ -38,7 +38,9 @@ mod tests;
 
 pub use archive::{ArchiveReader, ArchiveType, ArchiveWriter, SaveGameArchiveType};
 pub use compressed::CompressedReader;
-pub use context::{PropertyFilter, PropertySchemas, SaveGameArchive, Scope, Types};
+pub use context::{
+    NestedProperties, PropertyFilter, PropertySchemas, SaveGameArchive, Scope, Types,
+};
 pub use error::{Error, ParseError};
 
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
@@ -235,12 +237,12 @@ pub fn write_string<A: ArchiveWriter>(ar: &mut A, string: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "tracing", instrument(skip_all))]
 /// Longest string [`read_string_with`] reads without allocating.
 const SHORT_STRING_BYTES: usize = 64;
 
 /// Read a string like [`read_string`] and pass it to `f`, without allocating when it is
 /// short UTF-8, as type names are. For strings that are only matched, not kept.
+#[cfg_attr(feature = "tracing", instrument(skip_all))]
 fn read_string_with<A: ArchiveReader, T>(ar: &mut A, f: impl FnOnce(&str) -> T) -> Result<T> {
     let len = ar.read_i32::<LE>()?;
     if (0..=SHORT_STRING_BYTES as i32).contains(&len) {
@@ -529,6 +531,26 @@ where
         items.push(f(ar)?);
     }
     Ok(items)
+}
+
+/// Decode fixed-width values in small blocks instead of reading each number separately.
+/// Reserve only a bounded number of elements until their bytes have actually been read.
+fn read_numeric_array<T, const N: usize, A: ArchiveReader>(
+    count: u32,
+    ar: &mut A,
+    decode: impl Fn([u8; N]) -> T,
+) -> Result<Vec<T>> {
+    let mut values = Vec::with_capacity((count as usize).min(MAX_PREALLOCATED));
+    let mut buffer = [0u8; 4096];
+    let mut remaining = count as usize;
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() / N);
+        let bytes = &mut buffer[..count * N];
+        ar.read_exact(bytes)?;
+        values.extend(bytes.chunks_exact(N).map(|v| decode(v.try_into().unwrap())));
+        remaining -= count;
+    }
+    Ok(values)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -933,7 +955,7 @@ impl PropertyTagFull<'_> {
 
             Ok(Some(tag))
         } else {
-            ar.scope().push(&name.clone());
+            ar.scope().push(&name);
             let result = (|| {
                 let type_ = PropertyType::read(ar)?;
                 let size = ar.read_u32::<LE>()?;
@@ -3991,6 +4013,9 @@ pub enum ValueVec<T: ArchiveType = SaveGameArchiveType> {
     Box(Vec<Box>),
     Box2D(Vec<Box2D>),
     Struct(Vec<StructValue<T>>),
+    /// A byte array decoded as a property list (see [`SaveReader::nested`]). Read only:
+    /// a save holding one can't be written back out.
+    Properties(Properties<T>),
 }
 
 impl<T: ArchiveType> StructValue<T> {
@@ -4160,42 +4185,45 @@ impl<T: ArchiveType> ValueVec<T> {
     ) -> Result<ValueVec<T>> {
         Ok(match t {
             PropertyType::Int8Property => {
-                ValueVec::Int8(read_array(count, ar, |r| Ok(r.read_i8()?))?)
+                ValueVec::Int8(read_numeric_array(count, ar, i8::from_le_bytes)?)
             }
             PropertyType::Int16Property => {
-                ValueVec::Int16(read_array(count, ar, |r| Ok(r.read_i16::<LE>()?))?)
+                ValueVec::Int16(read_numeric_array(count, ar, i16::from_le_bytes)?)
             }
             PropertyType::IntProperty => {
-                ValueVec::Int(read_array(count, ar, |r| Ok(r.read_i32::<LE>()?))?)
+                ValueVec::Int(read_numeric_array(count, ar, i32::from_le_bytes)?)
             }
             PropertyType::Int64Property => {
-                ValueVec::Int64(read_array(count, ar, |r| Ok(r.read_i64::<LE>()?))?)
+                ValueVec::Int64(read_numeric_array(count, ar, i64::from_le_bytes)?)
             }
             PropertyType::UInt8Property => {
-                ValueVec::UInt8(read_array(count, ar, |r| Ok(r.read_u8()?))?)
+                ValueVec::UInt8(read_numeric_array(count, ar, u8::from_le_bytes)?)
             }
             PropertyType::UInt16Property => {
-                ValueVec::UInt16(read_array(count, ar, |r| Ok(r.read_u16::<LE>()?))?)
+                ValueVec::UInt16(read_numeric_array(count, ar, u16::from_le_bytes)?)
             }
             PropertyType::UInt32Property => {
-                ValueVec::UInt32(read_array(count, ar, |r| Ok(r.read_u32::<LE>()?))?)
+                ValueVec::UInt32(read_numeric_array(count, ar, u32::from_le_bytes)?)
             }
             PropertyType::UInt64Property => {
-                ValueVec::UInt64(read_array(count, ar, |r| Ok(r.read_u64::<LE>()?))?)
+                ValueVec::UInt64(read_numeric_array(count, ar, u64::from_le_bytes)?)
             }
-            PropertyType::FloatProperty => {
-                ValueVec::Float(read_array(count, ar, |r| Ok(r.read_f32::<LE>()?.into()))?)
-            }
-            PropertyType::DoubleProperty => {
-                ValueVec::Double(read_array(count, ar, |r| Ok(r.read_f64::<LE>()?.into()))?)
-            }
+            PropertyType::FloatProperty => ValueVec::Float(read_numeric_array(count, ar, |v| {
+                f32::from_le_bytes(v).into()
+            })?),
+            PropertyType::DoubleProperty => ValueVec::Double(read_numeric_array(count, ar, |v| {
+                f64::from_le_bytes(v).into()
+            })?),
             PropertyType::BoolProperty => {
-                ValueVec::Bool(read_array(count, ar, |r| Ok(r.read_u8()? > 0))?)
+                ValueVec::Bool(read_numeric_array(count, ar, |[v]| v > 0)?)
             }
             PropertyType::ByteProperty => {
                 if size == count {
                     let bytes = read_bytes(ar, count as usize)?;
-                    ValueVec::Byte(ByteArray::Byte(bytes))
+                    match ar.read_nested_properties(&bytes) {
+                        Some(properties) => ValueVec::Properties(properties),
+                        None => ValueVec::Byte(ByteArray::Byte(bytes)),
+                    }
                 } else {
                     ValueVec::Byte(ByteArray::Label(read_array(count, ar, |r| {
                         r.read_string()
@@ -4221,6 +4249,12 @@ impl<T: ArchiveType> ValueVec<T> {
     }
     fn write<A: ArchiveWriter<ArchiveType = T>>(&self, ar: &mut A) -> Result<()> {
         match &self {
+            ValueVec::Properties(_) => {
+                return Err(Error::Other(format!(
+                    "{}: a byte array decoded as properties can't be written back out",
+                    ar.path()
+                )))
+            }
             ValueVec::Int8(v) => {
                 ar.write_u32::<LE>(v.len() as u32)?;
                 for i in v {
@@ -4366,7 +4400,7 @@ impl<T: ArchiveType> ValueVec<T> {
     )]
     fn read_array<A: ArchiveReader<ArchiveType = T>>(
         ar: &mut A,
-        tag: PropertyTagDataFull,
+        tag: &PropertyTagDataFull,
         size: u32,
     ) -> Result<(ValueVec<T>, Option<PropertyTagDataFull>)> {
         let count = ar.read_u32::<LE>()?;
@@ -4397,7 +4431,7 @@ impl<T: ArchiveType> ValueVec<T> {
                         (StructType::Struct(None), None)
                     }
                 } else {
-                    (struct_type, None)
+                    (struct_type.clone(), None)
                 };
 
                 let mut value = vec![];
@@ -4543,12 +4577,35 @@ impl<T: ArchiveType> Property<T> {
         // Save the current position before attempting to parse
         let start_position = ar.stream_position()?;
 
-        // Try to parse the property directly from the stream
-        let (inner, updated_tag_data) = match Self::try_read_inner(ar, tag) {
+        // Try to parse the property directly from the stream. A value that doesn't use exactly
+        // the bytes its tag declares was read wrongly (a wrong type hint, say) even if nothing
+        // failed yet: treat it as failed here, rather than misreading what follows it and
+        // failing further up, where the fallback would take a whole enclosing property.
+        let result = Self::try_read_inner(ar, tag).and_then(|result| {
+            let read = ar.stream_position()? - start_position;
+            if read == tag.size as u64 {
+                Ok(result)
+            } else {
+                Err(Error::Other(format!(
+                    "read {read} bytes of a {}-byte property",
+                    tag.size
+                )))
+            }
+        });
+        let (inner, updated_tag_data) = match result {
             Ok(result) => result,
             Err(e) => {
                 // Check if we should convert errors to raw properties
                 if ar.error_to_raw() {
+                    #[cfg(feature = "tracing")]
+                    let _span = tracing::info_span!(
+                        target: "uesave::perf",
+                        "save.raw_fallback",
+                        bytes = tag.size,
+                        path = %ar.path(),
+                        error = %e,
+                    )
+                    .entered();
                     // Parsing failed, seek back to start and read raw data
                     if ar.log() {
                         eprintln!("Warning: Failed to parse property '{}': {}", ar.path(), e);
@@ -4597,7 +4654,7 @@ impl<T: ArchiveType> Property<T> {
                 (Property::Map(value), None)
             }
             PropertyTagDataFull::Array(data) => {
-                let (array, updated_data) = ValueVec::read_array(ar, *data.clone(), tag.size - 4)?;
+                let (array, updated_data) = ValueVec::read_array(ar, data, tag.size - 4)?;
                 (Property::Array(array), updated_data)
             }
             // Bool is special - value stored in tag for top-level properties
@@ -4992,7 +5049,7 @@ pub struct Save {
 }
 impl Save {
     /// Reads save from the given reader
-    #[cfg_attr(feature = "tracing", instrument(name = "Root_read", skip_all))]
+    #[cfg_attr(feature = "tracing", instrument(name = "Save_read", skip_all))]
     pub fn read<R: Read>(reader: &mut R) -> Result<Self, ParseError> {
         Self::read_with_types(reader, Types::new())
     }
@@ -5017,6 +5074,7 @@ impl Save {
             error_to_raw: true,
             schemas,
             filter: None,
+            nested: None,
         };
 
         self.header.write(&mut archive_writer)?;
@@ -5033,6 +5091,7 @@ pub struct SaveReader {
     error_to_raw: bool,
     types: Option<Rc<Types>>,
     filter: Option<Rc<PropertyFilter>>,
+    nested: Option<Rc<NestedProperties>>,
 }
 impl Default for SaveReader {
     fn default() -> Self {
@@ -5046,6 +5105,7 @@ impl SaveReader {
             error_to_raw: false,
             types: None,
             filter: None,
+            nested: None,
         }
     }
     pub fn log(mut self, log: bool) -> Self {
@@ -5077,6 +5137,20 @@ impl SaveReader {
         self.filter = Some(Rc::new(PropertyFilter::new(paths)));
         self
     }
+    /// Decode the byte arrays at these paths (dot-joined, matched exactly) as property
+    /// lists, for games that serialize a struct's tagged properties, or a whole object
+    /// with `UObject::Serialize`, into a `TArray<uint8>`. They read as
+    /// [`ValueVec::Properties`] instead of bytes; one that doesn't parse as a property
+    /// list stays as bytes. The object GUID flag `UObject::Serialize` writes after the
+    /// properties is read past and not kept. A save read this way can't be written back
+    /// out.
+    ///
+    /// Paths are the ones the reader is at: inside a map's struct values that is
+    /// `<map>.<field>`, without the `Key`/`Value` segment that struct type hints use.
+    pub fn nested(mut self, paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.nested = Some(Rc::new(NestedProperties::new(paths)));
+        self
+    }
     /// Read a save from any reader. The stream is buffered so it can be seeked; use
     /// [`read_seekable`](Self::read_seekable) for streams that can already seek.
     pub fn read<S: Read>(self, stream: S) -> Result<Save, ParseError> {
@@ -5084,6 +5158,10 @@ impl SaveReader {
     }
     /// Read a save from a seekable stream, such as a `Cursor` over bytes in memory or a
     /// [`CompressedReader`], without buffering it. Skipped properties are seeked over.
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "save.read", target = "uesave::perf", skip_all)
+    )]
     pub fn read_seekable<S: Read + Seek>(self, stream: S) -> Result<Save, ParseError> {
         let types = self.types.unwrap_or_else(|| Rc::new(Types::new()));
         let schemas = Rc::new(RefCell::new(PropertySchemas::new()));
@@ -5097,13 +5175,23 @@ impl SaveReader {
             error_to_raw: self.error_to_raw,
             schemas: schemas.clone(),
             filter: self.filter,
+            nested: self.nested,
         };
 
         let result = || -> Result<_> {
-            let header = Header::read(&mut reader)?;
+            let header = {
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!(target: "uesave::perf", "save.header").entered();
+                Header::read(&mut reader)?
+            };
             reader.set_version(header.clone());
 
-            let root = Root::read(&mut reader)?;
+            let root = {
+                #[cfg(feature = "tracing")]
+                let _span =
+                    tracing::info_span!(target: "uesave::perf", "save.properties").entered();
+                Root::read(&mut reader)?
+            };
             let extra = {
                 let mut buf = vec![];
                 reader.read_to_end(&mut buf)?;
@@ -5135,5 +5223,42 @@ impl SaveReader {
                 extra,
             })
             .map_err(|e| error::ParseError { offset, error: e })
+    }
+    /// Read a property list held in bytes, such as a byte array from a save that
+    /// [`nested`](Self::nested) can't decode on its own because the game wraps it in a
+    /// header of its own: strip the header, then pass the rest here. The list is tagged
+    /// properties up to `None`, optionally followed by the object GUID flag
+    /// `UObject::Serialize` writes; every byte must be read.
+    ///
+    /// `header` is the header of the save the bytes came from, for its versions. `path` is
+    /// where the bytes sit in that save, dot-joined as for [`Types`], so that this reader's
+    /// hints and nested paths below it apply; pass `""` for the root. Properties that fail
+    /// to parse become raw values only if [`error_to_raw`](Self::error_to_raw) is set;
+    /// otherwise the whole read fails.
+    pub fn read_properties(
+        self,
+        bytes: &[u8],
+        header: &Header,
+        path: &str,
+    ) -> Result<Properties, ParseError> {
+        let mut scope = Scope::root();
+        for segment in path.split('.').filter(|s| !s.is_empty()) {
+            scope.push(segment);
+        }
+        let mut reader = SaveGameArchive {
+            stream: Cursor::new(bytes),
+            version: Some(header.clone()),
+            types: self.types.unwrap_or_else(|| Rc::new(Types::new())),
+            scope,
+            log: self.log,
+            error_to_raw: self.error_to_raw,
+            schemas: Rc::new(RefCell::new(PropertySchemas::new())),
+            filter: None,
+            nested: self.nested,
+        };
+        archive::read_property_list(&mut reader).map_err(|error| error::ParseError {
+            offset: reader.stream.position() as usize,
+            error,
+        })
     }
 }
