@@ -33,13 +33,26 @@ impl Types {
 #[derive(Debug, Default, Clone)]
 pub struct PropertyFilter {
     paths: Vec<String>,
+    skipped: RefCell<Vec<crate::SkippedProperty>>,
 }
 impl PropertyFilter {
     /// Keep the properties at `paths` (and everything inside them)
     pub fn new(paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             paths: paths.into_iter().map(Into::into).collect(),
+            skipped: RefCell::default(),
         }
+    }
+    /// Note that the property at `path`, `size` bytes, was skipped
+    pub(crate) fn record_skipped(&self, path: &str, size: u64) {
+        self.skipped.borrow_mut().push(crate::SkippedProperty {
+            path: path.to_owned(),
+            size,
+        });
+    }
+    /// The properties skipped so far, leaving the list empty
+    pub(crate) fn take_skipped(&self) -> Vec<crate::SkippedProperty> {
+        self.skipped.take()
     }
     /// Whether the property at `path` should be read
     pub fn includes(&self, path: &str) -> bool {

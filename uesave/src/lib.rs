@@ -434,6 +434,7 @@ fn read_property<T: ArchiveType, A: ArchiveReader<ArchiveType = T>>(
     while let Some(mut tag) = PropertyTagFull::read(ar)? {
         ar.scope().push(&tag.name);
         if ar.skip_property() {
+            ar.record_skipped(tag.size as u64);
             ar.scope().pop();
             ar.seek(std::io::SeekFrom::Current(tag.size as i64))?;
             continue;
@@ -5046,6 +5047,20 @@ pub struct Save {
     pub schemas: PropertySchemas,
     pub root: Root,
     pub extra: Vec<u8>,
+    /// The properties a filtered read ([`SaveReader::only`]) skipped, in the order they
+    /// were met. Empty for a read without a filter. Not serialized.
+    #[serde(skip)]
+    pub skipped: Vec<SkippedProperty>,
+}
+
+/// A property that a filtered read skipped without parsing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedProperty {
+    /// Its dot-joined path, as for [`Types`]. Every element of an array of structs has
+    /// the same paths, so a property inside one is listed once per element.
+    pub path: String,
+    /// The size of its value in bytes, as its tag declares; the tag itself isn't counted.
+    pub size: u64,
 }
 impl Save {
     /// Reads save from the given reader
@@ -5132,7 +5147,8 @@ impl SaveReader {
     /// whatever contains them. Other properties are skipped using the size in their
     /// tag, without being parsed, and are left out of the result. Much faster when
     /// only a few values are needed. Schemas are only recorded for properties read,
-    /// so a filtered save cannot be written back out.
+    /// so a filtered save cannot be written back out. What was skipped is listed in
+    /// [`Save::skipped`], with each property's size.
     pub fn only(mut self, paths: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.filter = Some(Rc::new(PropertyFilter::new(paths)));
         self
@@ -5165,6 +5181,7 @@ impl SaveReader {
     pub fn read_seekable<S: Read + Seek>(self, stream: S) -> Result<Save, ParseError> {
         let types = self.types.unwrap_or_else(|| Rc::new(Types::new()));
         let schemas = Rc::new(RefCell::new(PropertySchemas::new()));
+        let filter = self.filter.clone();
 
         let mut reader = SaveGameArchive {
             stream,
@@ -5221,6 +5238,9 @@ impl SaveReader {
                 schemas,
                 root,
                 extra,
+                skipped: filter
+                    .map(|filter| filter.take_skipped())
+                    .unwrap_or_default(),
             })
             .map_err(|e| error::ParseError { offset, error: e })
     }

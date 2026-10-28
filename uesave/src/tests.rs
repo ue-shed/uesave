@@ -611,6 +611,22 @@ fn test_only_reads_requested_properties() {
     for (key, value) in &only.root.properties.0 {
         assert_eq!(Some(value), full.root.properties.0.get(key));
     }
+    assert!(full.skipped.is_empty());
+}
+
+#[test]
+fn test_only_lists_what_it_skips() {
+    let full = SaveReader::new().read(Cursor::new(SAVE)).unwrap();
+    let names: Vec<&String> = full.root.properties.0.keys().map(|key| &key.1).collect();
+    let only = SaveReader::new()
+        .only([names[0].clone()])
+        .read_seekable(Cursor::new(SAVE))
+        .unwrap();
+
+    let skipped: Vec<&String> = only.skipped.iter().map(|s| &s.path).collect();
+    assert_eq!(skipped, names[1..]);
+    let total: u64 = only.skipped.iter().map(|s| s.size).sum();
+    assert!(total < SAVE.len() as u64);
 }
 
 #[test]
