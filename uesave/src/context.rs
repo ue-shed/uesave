@@ -220,6 +220,7 @@ impl<S> SaveGameArchive<S> {
             nested: None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn run<F, T>(stream: S, f: F) -> T
     where
         F: FnOnce(&mut SaveGameArchive<S>) -> T,
