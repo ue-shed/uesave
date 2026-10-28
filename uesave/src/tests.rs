@@ -748,7 +748,7 @@ fn test_numeric_arrays_across_read_and_compression_boundaries() -> Result<()> {
         let values: Vec<ValueVec> = vec![
             ValueVec::Int8((0..count).map(|i| (i as i8).wrapping_sub(70)).collect()),
             ValueVec::Int16((0..count).map(|i| i as i16 - 2000).collect()),
-            ValueVec::Int((0..count).map(|i| i as i32 * -123456).collect()),
+            ValueVec::Int((0..count).map(|i| i * -123456).collect()),
             ValueVec::Int64((0..count).map(|i| i as i64 * -12345678901).collect()),
             ValueVec::UInt8((0..count).map(|i| i as u8).collect()),
             ValueVec::UInt16((0..count).map(|i| i as u16 * 13).collect()),

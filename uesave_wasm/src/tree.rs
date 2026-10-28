@@ -388,7 +388,7 @@ mod tests {
             ValueVec::UInt16(vec![0, u16::MAX]),
             ValueVec::UInt32(vec![0, u32::MAX]),
             ValueVec::UInt64(vec![0, u64::MAX]),
-            ValueVec::Float(vec![28812.8671875f32.into(), f32::INFINITY.into()]),
+            ValueVec::Float(vec![28_812.867_f32.into(), f32::INFINITY.into()]),
             ValueVec::Double(vec![(-0.0).into(), f64::NEG_INFINITY.into()]),
             ValueVec::Bool(vec![false, true]),
             ValueVec::Enum(vec!["First".into(), "Last".into()]),

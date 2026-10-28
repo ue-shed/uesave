@@ -76,9 +76,6 @@ impl<R: Read> SeekReader<R> {
             reached_eof: false,
         }
     }
-    fn position(&self) -> usize {
-        self.position
-    }
     fn ensure_buffered(&mut self, min_bytes: usize) -> std::io::Result<()> {
         if self.reached_eof {
             return Ok(());
@@ -548,7 +545,7 @@ fn read_numeric_array<T, const N: usize, A: ArchiveReader>(
         let count = remaining.min(buffer.len() / N);
         let bytes = &mut buffer[..count * N];
         ar.read_exact(bytes)?;
-        values.extend(bytes.chunks_exact(N).map(|v| decode(v.try_into().unwrap())));
+        values.extend(bytes.as_chunks::<N>().0.iter().map(|v| decode(*v)));
         remaining -= count;
     }
     Ok(values)
@@ -3208,15 +3205,6 @@ impl SoftObjectPath {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SoftClassPath(pub SoftObjectPath);
-impl SoftClassPath {
-    #[cfg_attr(feature = "tracing", instrument(name = "SoftClassPath_read", skip_all))]
-    fn read<A: ArchiveReader>(ar: &mut A) -> Result<Self> {
-        Ok(Self(SoftObjectPath::read(ar)?))
-    }
-    fn write<A: ArchiveWriter>(&self, ar: &mut A) -> Result<()> {
-        self.0.write(ar)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GameplayTag {
@@ -3738,8 +3726,7 @@ impl Text {
                 generator_type_id: ar.read_string()?,
                 generator_contents: {
                     let len = ar.read_u32::<LE>()? as usize;
-                    let bytes = read_bytes(ar, len)?;
-                    bytes
+                    read_bytes(ar, len)?
                 },
             }),
             _ => Err(Error::Other(format!(
@@ -4950,7 +4937,7 @@ impl Header {
         if ar.log() && magic != u32::from_le_bytes(*b"GVAS") {
             eprintln!(
                 "Found non-standard magic: {:02x?} ({}) expected: GVAS, continuing to parse...",
-                &magic.to_le_bytes(),
+                magic.to_le_bytes(),
                 String::from_utf8_lossy(&magic.to_le_bytes())
             );
         }
