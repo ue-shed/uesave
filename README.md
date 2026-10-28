@@ -42,6 +42,9 @@
 >   then pass the rest. WASM: `ParsedSave.readProperties`.
 > - WASM `ParsedSave.value(path)` returns one node as a JavaScript value, with no JSON
 >   text in between.
+> - A filtered read lists the properties it skipped in `Save::skipped`, with each one's
+>   size from its tag. Read with a filter that keeps nothing to see every section of a
+>   save and its size without parsing any of it.
 >
 > The WASM build is published to npm as
 > [`@ue-shed/uesave-wasm`](https://www.npmjs.com/package/@ue-shed/uesave-wasm), versioned
